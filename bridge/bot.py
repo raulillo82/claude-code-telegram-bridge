@@ -39,6 +39,10 @@ def load_config() -> dict:
     with open(CONFIG_PATH, encoding="utf-8") as f:
         cfg = json.load(f)
     cfg["projects_dir"] = os.path.expanduser(cfg["projects_dir"])
+    # allowed_user_id must be an int to compare against Telegram's
+    # update.effective_user.id; tolerate it being quoted as a string in
+    # config.json, since that's an easy mistake to make by hand.
+    cfg["allowed_user_id"] = int(cfg["allowed_user_id"])
     return cfg
 
 
