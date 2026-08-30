@@ -28,8 +28,11 @@ as a fallback for the narrow case where you don't.
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) on Telegram and
    copy the token it gives you.
-2. Find your own numeric Telegram user ID (e.g. via [@userinfobot](https://t.me/userinfobot)).
-   This is a plain integer Telegram assigns to your account internally — it
+2. Find your own numeric Telegram user ID (e.g. via [@Getmyid_bot](https://t.me/Getmyid_bot);
+   [@userinfobot](https://t.me/userinfobot) is the more commonly recommended
+   one but didn't respond in testing — try it first if you like, fall back to
+   @Getmyid_bot if it stays silent). This is a plain integer Telegram assigns
+   to your account internally — it
    is **not** your `@username`, and it must **not** be quoted as a string in
    `config.json` (`123456789`, not `"123456789"` — though the loader tolerates
    a quoted string too, just don't rely on it).
