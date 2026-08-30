@@ -1,0 +1,14 @@
+[Unit]
+Description=Claude Code Telegram bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/claude/claude-code-telegram-bridge
+ExecStart=%h/claude/claude-code-telegram-bridge/.venv/bin/python %h/claude/claude-code-telegram-bridge/run.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
