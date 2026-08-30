@@ -6,6 +6,8 @@ Anthropic's servers, but Telegram traffic can. Long-polling, so it needs no
 inbound port on the machine running it.
 """
 
+import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -55,6 +57,21 @@ def load_config() -> dict:
 
 def is_authorized(update: Update, allowed_user_id: int) -> bool:
     return update.effective_user is not None and update.effective_user.id == allowed_user_id
+
+
+async def _keep_typing(bot, chat_id: int) -> None:
+    """Refresh Telegram's "typing..." indicator every few seconds.
+
+    Telegram clears it after ~5s on its own, so a single send_chat_action
+    before a long-running `claude -p` call (which can easily take minutes)
+    leaves the chat looking idle well before the reply actually arrives.
+    """
+    try:
+        while True:
+            await bot.send_chat_action(chat_id, "typing")
+            await asyncio.sleep(4)
+    except asyncio.CancelledError:
+        pass
 
 
 async def send_long_message(update: Update, text: str) -> None:
@@ -252,10 +269,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     mode = state.check_and_touch(chat_id, cfg["flight_mode_idle_minutes"])
     extra_args = permissions.build_claude_args(mode)
 
-    await context.bot.send_chat_action(chat_id, "typing")
-
-    async with state.lock_for(resolved):
-        result = await run_claude(project_dir, text, extra_args)
+    typing_task = asyncio.create_task(_keep_typing(context.bot, chat_id))
+    try:
+        async with state.lock_for(resolved):
+            result = await run_claude(project_dir, text, extra_args)
+    finally:
+        typing_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await typing_task
 
     reply = f"[{resolved}] {result.text}"
     if result.permission_denied and mode == "normal":
