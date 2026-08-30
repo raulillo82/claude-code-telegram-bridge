@@ -12,7 +12,7 @@ import os
 import time
 from pathlib import Path
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -24,6 +24,7 @@ from telegram.ext import (
 
 from . import permissions, projects
 from .claude_runner import run_claude
+from .history_preview import get_last_assistant_message
 from .state import BotState
 
 logging.basicConfig(
@@ -33,6 +34,12 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 TELEGRAM_MAX_CHARS = 4000
+
+BOT_COMMANDS = [
+    BotCommand("start", "Show bridge status and quick help"),
+    BotCommand("projects", "Pick the active project"),
+    BotCommand("mode", "Show or set the permission mode (normal/flight)"),
+]
 
 
 def load_config() -> dict:
@@ -145,7 +152,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if data.startswith("proj:"):
         name = data[len("proj:") :]
         state.set_active_project(chat_id, name)
-        await query.edit_message_text(f"Active project: {name}")
+        project_dir = os.path.join(cfg["projects_dir"], name)
+        preview = get_last_assistant_message(project_dir)
+        reply = f"Active project: {name}"
+        if preview:
+            reply += f"\n\nLast time you were here:\n{preview}"
+        await query.edit_message_text(reply)
         return
 
     if data == "create_no":
@@ -252,11 +264,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await send_long_message(update, reply)
 
 
+async def _register_commands(application: Application) -> None:
+    await application.bot.set_my_commands(BOT_COMMANDS)
+
+
 def main() -> None:
     cfg = load_config()
     state = BotState()
 
-    app = Application.builder().token(cfg["bot_token"]).build()
+    app = Application.builder().token(cfg["bot_token"]).post_init(_register_commands).build()
     app.bot_data["config"] = cfg
     app.bot_data["state"] = state
 
