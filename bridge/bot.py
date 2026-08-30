@@ -41,6 +41,8 @@ BOT_COMMANDS = [
     BotCommand("start", "Show bridge status and quick help"),
     BotCommand("projects", "Pick the active project"),
     BotCommand("mode", "Show or set the permission mode (normal/flight)"),
+    BotCommand("compact", "Compact the active project's conversation history"),
+    BotCommand("clear", "Clear the active project's conversation history"),
 ]
 
 
@@ -117,6 +119,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Claude Code bridge ready.\n"
         "/projects - pick the active project\n"
         "/mode [normal|flight] - show or set the permission mode\n"
+        "/compact - compact the active project's history\n"
+        "/clear - wipe the active project's history (asks to confirm)\n"
         "Send text (or a photo/document) to talk to the active project.\n"
         "Prefix a message with @project to send it elsewhere just once."
     )
@@ -131,6 +135,132 @@ async def cmd_projects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(f"No projects found under {cfg['projects_dir']}")
         return
     await update.message.reply_text("Pick a project:", reply_markup=project_picker_markup(names))
+
+
+async def _run_claude_with_typing(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    project_name: str,
+    project_dir: str,
+    prompt: str,
+    extra_args: list[str],
+):
+    state: BotState = context.bot_data["state"]
+    typing_task = asyncio.create_task(_keep_typing(context.bot, chat_id))
+    try:
+        async with state.lock_for(project_name):
+            return await run_claude(project_dir, prompt, extra_args)
+    finally:
+        typing_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await typing_task
+
+
+async def _resolve_active_project_for_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Resolve the chat's active project for /compact and /clear.
+
+    Unlike a regular message, there's no "create it?" flow here -- clearing
+    or compacting a project that doesn't exist yet makes no sense. Returns
+    (resolved_name, project_dir) or None after sending an explanatory
+    reply.
+    """
+    cfg = context.bot_data["config"]
+    state: BotState = context.bot_data["state"]
+    chat_id = update.message.chat_id
+
+    project_name = state.get_active_project(chat_id)
+    if not project_name:
+        await update.message.reply_text("No active project. Use /projects first.")
+        return None
+
+    resolved, info = projects.resolve_project(project_name, cfg["projects_dir"])
+    if resolved is None:
+        if info:
+            await update.message.reply_text(
+                f"Active project '{project_name}' is ambiguous, matches: {', '.join(info)}."
+            )
+        else:
+            await update.message.reply_text(f"Active project '{project_name}' no longer exists.")
+        return None
+
+    project_dir = os.path.join(cfg["projects_dir"], resolved)
+    live_pid = projects.has_live_session(project_dir)
+    if live_pid:
+        await update.message.reply_text(
+            f"[{resolved}] There is a live Claude Code session on this project right now "
+            f"(pid {live_pid}). Not touching it, to avoid two processes racing on the same history."
+        )
+        return None
+
+    return resolved, project_dir
+
+
+EMPTY_RESPONSE_MARKER = "(empty response)"
+
+
+def _or_fallback(text: str, fallback: str) -> str:
+    """`claude -p` prints nothing for /compact or /clear when there was no
+    history to act on -- that's a normal outcome, not a failure, so swap in
+    a message that says so instead of the generic empty-response marker."""
+    return fallback if text in ("", EMPTY_RESPONSE_MARKER) else text
+
+
+# A genuine "nothing to compact" no-op returns in well under a second
+# (observed: ~23ms). A real compaction invokes the model to summarize the
+# conversation and can take tens of seconds to minutes -- but still prints
+# no chat text on success, since the confirmation is a structured event,
+# not an assistant reply. Above this threshold with empty text, assume it
+# actually did the work rather than claim nothing happened.
+SILENT_SUCCESS_DURATION_MS = 5000
+
+
+def _compact_summary(result) -> str:
+    if result.text not in ("", EMPTY_RESPONSE_MARKER):
+        return result.text
+    if result.duration_ms and result.duration_ms > SILENT_SUCCESS_DURATION_MS:
+        seconds = result.duration_ms / 1000
+        return (
+            f"No summary text was printed, but it took {seconds:.0f}s of real work -- "
+            "likely compacted successfully rather than finding nothing to do."
+        )
+    return "Nothing to compact yet."
+
+
+async def cmd_compact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg = context.bot_data["config"]
+    if not is_authorized(update, cfg["allowed_user_id"]):
+        return
+    resolved_info = await _resolve_active_project_for_command(update, context)
+    if resolved_info is None:
+        return
+    resolved, project_dir = resolved_info
+    chat_id = update.message.chat_id
+    await update.message.reply_text(
+        f"[{resolved}] Compacting... this can take a couple of minutes on a large history."
+    )
+    result = await _run_claude_with_typing(context, chat_id, resolved, project_dir, "/compact", [])
+    await send_long_message(update, f"[{resolved}] {_compact_summary(result)}")
+
+
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg = context.bot_data["config"]
+    if not is_authorized(update, cfg["allowed_user_id"]):
+        return
+    resolved_info = await _resolve_active_project_for_command(update, context)
+    if resolved_info is None:
+        return
+    resolved, _ = resolved_info
+    markup = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Clear it", callback_data=f"clear_yes:{resolved}"),
+                InlineKeyboardButton("Cancel", callback_data="clear_no"),
+            ]
+        ]
+    )
+    await update.message.reply_text(
+        f"Clear conversation history for '{resolved}'? This can't be undone.", reply_markup=markup
+    )
 
 
 async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -191,6 +321,26 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.edit_message_text(
             f"Created '{name}' and set it active. Send your message again."
         )
+        return
+
+    if data == "clear_no":
+        await query.edit_message_text("Cancelled.")
+        return
+
+    if data.startswith("clear_yes:"):
+        name = data[len("clear_yes:") :]
+        project_dir = os.path.join(cfg["projects_dir"], name)
+        live_pid = projects.has_live_session(project_dir)
+        if live_pid:
+            await query.edit_message_text(
+                f"[{name}] There is a live Claude Code session on this project now "
+                f"(pid {live_pid}). Not clearing."
+            )
+            return
+        await query.edit_message_text(f"[{name}] Clearing...")
+        result = await _run_claude_with_typing(context, chat_id, name, project_dir, "/clear", [])
+        text = _or_fallback(result.text, "Cleared.")
+        await context.bot.send_message(chat_id, f"[{name}] {text}")
         return
 
 
@@ -300,6 +450,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("projects", cmd_projects))
     app.add_handler(CommandHandler("mode", cmd_mode))
+    app.add_handler(CommandHandler("compact", cmd_compact))
+    app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
