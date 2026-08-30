@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/claude/claude-code-telegram-bridge
 ExecStart=%h/claude/claude-code-telegram-bridge/.venv/bin/python %h/claude/claude-code-telegram-bridge/run.py
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 [Install]
