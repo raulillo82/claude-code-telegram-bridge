@@ -28,13 +28,39 @@ as a fallback for the narrow case where you don't.
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) on Telegram and
    copy the token it gives you.
-2. Find your own numeric Telegram user ID (e.g. via [@userinfobot](https://t.me/userinfobot)).
+2. Find your own numeric Telegram user ID (e.g. via [@Getmyid_bot](https://t.me/Getmyid_bot);
+   [@userinfobot](https://t.me/userinfobot) is the more commonly recommended
+   one but didn't respond in testing — try it first if you like, fall back to
+   @Getmyid_bot if it stays silent). This is a plain integer Telegram assigns
+   to your account internally — it
+   is **not** your `@username`, and it must **not** be quoted as a string in
+   `config.json` (`123456789`, not `"123456789"` — though the loader tolerates
+   a quoted string too, just don't rely on it).
 3. Copy `config.example.json` to `config.json` and fill in `bot_token`,
    `allowed_user_id`, and `projects_dir` (the parent directory holding your
    Claude Code project folders). `config.json` is gitignored — never commit
    it.
 4. `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
-5. `.venv/bin/python run.py`
+5. Run it directly for a quick test: `.venv/bin/python run.py`. For actual
+   use, install it as a systemd user service instead (see below) — a
+   foreground process tied to a terminal (or to someone else's shell
+   session) dies the moment that session closes.
+
+### Running it as a systemd service (recommended)
+
+```
+mkdir -p ~/.config/systemd/user
+ln -s ~/claude/claude-code-telegram-bridge/deploy/claude-code-telegram-bridge.service \
+      ~/.config/systemd/user/claude-code-telegram-bridge.service
+systemctl --user daemon-reload
+systemctl --user enable --now claude-code-telegram-bridge.service
+loginctl enable-linger "$USER"   # keep it running with no active login session
+```
+
+The unit assumes the repo lives at `~/claude/claude-code-telegram-bridge`;
+edit `deploy/claude-code-telegram-bridge.service` first if yours doesn't.
+Check on it with `systemctl --user status claude-code-telegram-bridge` or
+`journalctl --user -u claude-code-telegram-bridge -f`.
 
 ## Usage
 

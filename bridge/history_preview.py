@@ -13,7 +13,7 @@ import os
 
 from .claude_runner import encode_project_path
 
-DEFAULT_MAX_CHARS = 300
+DEFAULT_MAX_CHARS = 800
 
 
 def _latest_transcript(store_dir: str) -> str | None:
