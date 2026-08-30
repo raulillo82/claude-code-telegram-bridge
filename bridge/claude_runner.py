@@ -1,6 +1,7 @@
 """Wraps headless `claude -p` invocations for a single project directory."""
 
 import asyncio
+import json
 import os
 import re
 
@@ -31,9 +32,15 @@ DEFAULT_TIMEOUT_SECONDS = 300
 
 
 class ClaudeResult:
-    def __init__(self, text: str, permission_denied: bool):
+    def __init__(self, text: str, permission_denied: bool, duration_ms: int | None = None):
         self.text = text
         self.permission_denied = permission_denied
+        # Only reliably set when the CLI's JSON output parsed cleanly.
+        # /compact and /clear can genuinely succeed while printing no text
+        # at all (the confirmation is a structured event, not chat text) --
+        # a real duration lets callers tell "nothing to do" (near-instant)
+        # apart from "did something silently" (took real time).
+        self.duration_ms = duration_ms
 
 
 def clean_env() -> dict:
@@ -69,7 +76,7 @@ async def run_claude(
     extra_args: list[str],
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> ClaudeResult:
-    args = ["claude", "-p", prompt]
+    args = ["claude", "-p", prompt, "--output-format", "json"]
     if has_prior_history(project_dir):
         args.append("--continue")
     args.extend(extra_args)
@@ -90,6 +97,19 @@ async def run_claude(
 
     out = stdout.decode(errors="replace").strip()
     err = stderr.decode(errors="replace").strip()
+
+    if out:
+        try:
+            payload = json.loads(out)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            text = payload.get("result") or ""
+            duration_ms = payload.get("duration_ms")
+            combined = text or err or "(empty response)"
+            denied = bool(PERMISSION_DENY_PATTERNS.search(combined))
+            return ClaudeResult(combined, denied, duration_ms)
+
     combined = out or err or "(empty response)"
     denied = bool(PERMISSION_DENY_PATTERNS.search(combined))
     return ClaudeResult(combined, denied)

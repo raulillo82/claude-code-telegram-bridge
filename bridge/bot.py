@@ -205,6 +205,27 @@ def _or_fallback(text: str, fallback: str) -> str:
     return fallback if text in ("", EMPTY_RESPONSE_MARKER) else text
 
 
+# A genuine "nothing to compact" no-op returns in well under a second
+# (observed: ~23ms). A real compaction invokes the model to summarize the
+# conversation and can take tens of seconds to minutes -- but still prints
+# no chat text on success, since the confirmation is a structured event,
+# not an assistant reply. Above this threshold with empty text, assume it
+# actually did the work rather than claim nothing happened.
+SILENT_SUCCESS_DURATION_MS = 5000
+
+
+def _compact_summary(result) -> str:
+    if result.text not in ("", EMPTY_RESPONSE_MARKER):
+        return result.text
+    if result.duration_ms and result.duration_ms > SILENT_SUCCESS_DURATION_MS:
+        seconds = result.duration_ms / 1000
+        return (
+            f"No summary text was printed, but it took {seconds:.0f}s of real work -- "
+            "likely compacted successfully rather than finding nothing to do."
+        )
+    return "Nothing to compact yet."
+
+
 async def cmd_compact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg = context.bot_data["config"]
     if not is_authorized(update, cfg["allowed_user_id"]):
@@ -214,9 +235,11 @@ async def cmd_compact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     resolved, project_dir = resolved_info
     chat_id = update.message.chat_id
+    await update.message.reply_text(
+        f"[{resolved}] Compacting... this can take a couple of minutes on a large history."
+    )
     result = await _run_claude_with_typing(context, chat_id, resolved, project_dir, "/compact", [])
-    text = _or_fallback(result.text, "Nothing to compact yet.")
-    await send_long_message(update, f"[{resolved}] {text}")
+    await send_long_message(update, f"[{resolved}] {_compact_summary(result)}")
 
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
