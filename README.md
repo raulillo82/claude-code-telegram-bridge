@@ -105,6 +105,82 @@ this detection is not guaranteed to catch every case.
   account can act on your projects while in flight mode. Telegram's own
   Two-Step Verification is the relevant defense on that side.
 
+## Simulating the restrictive network locally
+
+Before trusting this in the air, it's worth simulating the "messaging-only"
+network on hardware you control, so you can watch the failure/success modes
+directly instead of taking it on faith. This was done using the machine
+running the bridge itself as a temporary WiFi router:
+
+1. **Create an isolated hotspot** on a spare wireless interface (call it
+   `wlanX` below — use whatever `ip -br a` shows on your machine), leaving
+   the machine's normal uplink (Ethernet, or another WiFi radio) untouched
+   so the bridge itself keeps full connectivity throughout the test:
+   ```
+   nmcli device wifi hotspot ifname wlanX con-name flight-sim-test \
+       ssid <ssid> band bg password <password>
+   ```
+   NetworkManager handles DHCP/NAT for the hotspot subnet (typically
+   `10.42.0.0/24`) automatically.
+2. **Enable IP forwarding** if it isn't already (`sysctl -w
+   net.ipv4.ip_forward=1` — NetworkManager enables it per-interface for a
+   shared connection, but not the global switch, which acts as a master
+   override; without this nothing is actually forwarded despite the NAT
+   rules being in place).
+3. **Add a restrictive nftables table** in front of NetworkManager's own
+   permissive one (lower priority number = evaluated first), default-accept
+   overall but explicitly rejecting anything from the hotspot that isn't
+   Telegram or DNS:
+   ```
+   table ip flight-test {
+       chain forward {
+           type filter hook forward priority -10; policy accept;
+           iifname "wlanX" oifname "wlanX" accept
+           oifname "wlanX" ct state established,related accept
+           iifname "wlanX" ip daddr { <Telegram's published CIDR ranges> } tcp dport { 80, 443 } accept
+           iifname "wlanX" udp dport 53 accept
+           iifname "wlanX" tcp dport 53 accept
+           iifname "wlanX" reject
+       }
+   }
+   ```
+   Telegram publishes its IP ranges at
+   [core.telegram.org/resources/cidr.txt](https://core.telegram.org/resources/cidr.txt).
+   Add `counter` before each `accept`/`reject` verdict while testing —
+   `nft list table ip flight-test` then shows exactly which rule is
+   firing, which is far more reliable than guessing from app behavior.
+4. **Connect a test device to the hotspot and verify both directions**:
+   Telegram should work normally; Claude's own app/website and Claude
+   Code's Remote Control should fail to connect.
+5. **Tear down** when done: `nft delete table ip flight-test`, `nmcli
+   connection delete flight-sim-test`, and revert
+   `net.ipv4.ip_forward` to whatever it was before.
+
+A few pitfalls that came up in practice, worth checking for before
+concluding the test passed or failed:
+
+- **Multi-network features on the test device.** Some phones can stay
+  associated to two WiFi networks at once (for seamless roaming). If the
+  device's previously-known WiFi is still in range, it can silently serve
+  some of the traffic and completely invalidate the test — disable that
+  option and confirm the device is *only* on the test hotspot.
+- **The OS's own connectivity check** (e.g. `connectivitycheck.gstatic.com`,
+  `captive.apple.com`) will fail against a restrictive network like this
+  and the device will show a "no internet" warning even though the
+  allowed traffic works fine — this is expected, and mirrors what a real
+  restrictive in-flight network does too. Dismiss it and continue.
+- **A cached/stale response can look like a live one.** A remote-control
+  or chat app may show its last-known state without clearly indicating
+  it's offline. Sending something the app couldn't possibly have cached
+  (a made-up word or number) confirms whether a response is actually
+  live.
+- **`ct state established,related accept` is destination-agnostic.**
+  If a connection was permitted before the restrictive table was loaded
+  (e.g. during a `delete table` + reload gap, however brief), this rule
+  will keep allowing its traffic afterward regardless of where it's
+  going. Load the ruleset atomically (a single `nft -f` covering the
+  whole table) rather than deleting and recreating it live.
+
 ## Limitations
 
 - No conversation state is persisted across a bot restart (active
