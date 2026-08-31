@@ -263,6 +263,20 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _mode_markup(current: str) -> InlineKeyboardMarkup:
+    def label(name: str) -> str:
+        return f"✅ {name}" if name == current else name
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(label("normal"), callback_data="mode:normal"),
+                InlineKeyboardButton(label("flight"), callback_data="mode:flight"),
+            ]
+        ]
+    )
+
+
 async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg = context.bot_data["config"]
     if not is_authorized(update, cfg["allowed_user_id"]):
@@ -271,7 +285,11 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
 
     if not context.args:
-        await update.message.reply_text(f"Current mode: {state.get_mode(chat_id)}")
+        current = state.get_mode(chat_id)
+        await update.message.reply_text(
+            f"Current mode: {current}\n\nTap to switch, or use /mode normal | /mode flight.",
+            reply_markup=_mode_markup(current),
+        )
         return
 
     requested = context.args[0].lower()
@@ -295,6 +313,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state: BotState = context.bot_data["state"]
     chat_id = query.message.chat_id
     data = query.data
+
+    if data.startswith("mode:"):
+        requested = data[len("mode:") :]
+        state.set_mode(chat_id, requested)
+        state.last_activity[chat_id] = time.time()
+        await query.edit_message_text(
+            f"Mode set to: {requested}", reply_markup=_mode_markup(requested)
+        )
+        return
 
     if data.startswith("proj:"):
         name = data[len("proj:") :]

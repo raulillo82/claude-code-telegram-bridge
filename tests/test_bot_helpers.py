@@ -1,4 +1,4 @@
-from bridge.bot import EMPTY_RESPONSE_MARKER, _compact_summary, _or_fallback
+from bridge.bot import EMPTY_RESPONSE_MARKER, _compact_summary, _mode_markup, _or_fallback
 
 
 def test_or_fallback_replaces_empty_response_marker():
@@ -44,3 +44,21 @@ def test_compact_summary_reports_silent_success_when_slow_and_empty():
 def test_compact_summary_handles_missing_duration():
     result = _FakeResult("", duration_ms=None)
     assert _compact_summary(result) == "Nothing to compact yet."
+
+
+def test_mode_markup_marks_current_mode():
+    markup = _mode_markup("normal")
+    labels = [button.text for row in markup.inline_keyboard for button in row]
+    assert labels == ["✅ normal", "flight"]
+
+
+def test_mode_markup_switches_check_to_flight():
+    markup = _mode_markup("flight")
+    labels = [button.text for row in markup.inline_keyboard for button in row]
+    assert labels == ["normal", "✅ flight"]
+
+
+def test_mode_markup_callback_data_is_stable_regardless_of_current_mode():
+    markup = _mode_markup("flight")
+    callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+    assert callbacks == ["mode:normal", "mode:flight"]
