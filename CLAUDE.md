@@ -6,25 +6,28 @@
 
 ## Deployment
 
-- The bridge runs on `raspberrypi4` (not on `mordor`, where it originally
-  lived). Reason: mordor is a laptop that gets carried around or shut down
-  ("almost always" in its docking station isn't "always"), while the rpi4
-  is a dedicated always-on box that already runs other Claude automations.
-  Compute needs are negligible either way — the actual work happens via
-  the Anthropic API, the bridge itself just relays.
+- The bridge runs on a dedicated always-on Raspberry Pi (not on the
+  primary laptop, where it originally lived). Reason: the laptop gets
+  carried around or shut down ("almost always" in its docking station
+  isn't "always"), while the Pi already runs other Claude automations and
+  is never expected to go offline. Compute needs are negligible either
+  way — the actual work happens via the Anthropic API, the bridge itself
+  just relays. (See the user's own notes for which physical host is
+  currently which role — deliberately not named here, this repo is
+  public.)
 - This has no TPM dependency to worry about: the credential scheme (see
   below) is plain GPG + `gpg-agent` passphrase caching, not
   `systemd-creds`/TPM-sealed secrets. That TPM-based approach was tried
   and abandoned already (see the global `CLAUDE.md`'s credentials
   section) for an unrelated reason (polkit forcing an interactive
-  approval), so a host lacking a TPM (both Pis do) is not a blocker for
-  running this anywhere.
+  approval), so a host lacking a TPM is not a blocker for running this
+  anywhere.
 - Moving it to another host requires that host to have: the user's GPG
   secret key imported (`gpg --list-secret-keys`), `allow-preset-passphrase`
   in its `~/.gnupg/gpg-agent.conf` (plus the same
-  `default-cache-ttl`/`max-cache-ttl` as mordor's, 28800/86400 — a fresh
-  `gpg-agent.conf` won't have these), and the `gpg-unlock` shell function
-  from `~/.alias` copied over.
+  `default-cache-ttl`/`max-cache-ttl` as the previous host's, 28800/86400
+  — a fresh `gpg-agent.conf` won't have these), and the `gpg-unlock` shell
+  function from `~/.alias` copied over.
 
 ## Credentials
 
