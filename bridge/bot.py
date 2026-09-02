@@ -384,6 +384,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if state.is_materializing(name):
             await context.bot.send_message(chat_id, f"Already copying '{name}', hang on.")
             return
+        live_pid = await sync.has_remote_live_session(cfg, name)
+        if live_pid:
+            await context.bot.send_message(
+                chat_id,
+                f"There is a live Claude Code session on '{name}' on the other host "
+                f"(pid {live_pid}). Not copying it over right now.",
+            )
+            return
         project_dir = os.path.join(cfg["projects_dir"], name)
         state.start_materializing(name)
         await query.edit_message_text(f"Copying '{name}' from the other host...")
@@ -495,6 +503,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     project_dir = os.path.join(cfg["projects_dir"], resolved)
 
     live_pid = projects.has_live_session(project_dir)
+    if not live_pid and sync.sync_enabled(cfg):
+        # A live session on the *other* host is not just a races risk here:
+        # history sync would pull in its transcript, and --continue always
+        # resumes the most-recently-modified one, so it could hijack and
+        # continue that live conversation instead of starting fresh.
+        live_pid = await sync.has_remote_live_session(cfg, resolved)
     if live_pid:
         await update.message.reply_text(
             f"[{resolved}] There is already a live Claude Code session on this project "
@@ -521,12 +535,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             pre = await sync.sync_project_with_remote(cfg, resolved, project_dir, "pull")
             if not pre.ok and not pre.skipped:
                 sync_warning = f"(could not sync before: {pre.detail})"
+            # Session history sync is best-effort in a stronger sense: "no
+            # history yet" is the common case, not a failure, so it never
+            # contributes to sync_warning.
+            await sync.sync_history_with_remote(cfg, project_dir, "pull")
             try:
                 result = await run_claude(project_dir, text, extra_args)
             finally:
                 post = await sync.sync_project_with_remote(cfg, resolved, project_dir, "push")
                 if not post.ok and not post.skipped:
                     sync_warning = f"(could not sync after: {post.detail})"
+                await sync.sync_history_with_remote(cfg, project_dir, "push")
     finally:
         typing_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):

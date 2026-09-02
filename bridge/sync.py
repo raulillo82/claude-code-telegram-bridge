@@ -20,6 +20,8 @@ import asyncio
 import logging
 import os
 
+from .claude_runner import encode_project_path
+
 logger = logging.getLogger(__name__)
 
 RSYNC_EXCLUDES = [".git", ".venv", "venv", "__pycache__", "node_modules"]
@@ -128,6 +130,90 @@ async def sync_project_with_remote(
     return await _run_subprocess(args, cfg["sync_rsync_timeout_seconds"])
 
 
+def claude_history_dir(project_dir: str) -> str:
+    """Local path to this project's Claude Code session history.
+
+    This lives under ~/.claude/projects/<encoded-path>/, entirely outside
+    the project directory itself -- so neither this module's rsync (for
+    non-git projects) nor git (for git-managed ones) ever touches it, and
+    a session continued via the bridge on one host silently forks away
+    from what `claude --continue` sees on the other host. Unlike the
+    project directory itself, this is never a git repo, so it's synced
+    regardless of whether the project it belongs to is git-managed."""
+    encoded = encode_project_path(project_dir)
+    return os.path.join(os.path.expanduser("~"), ".claude", "projects", encoded)
+
+
+async def sync_history_with_remote(cfg: dict, project_dir: str, direction: str) -> SyncResult:
+    """Sync a project's Claude Code session history with the remote host.
+
+    Assumes project_dir resolves to the same absolute path on both hosts
+    (same username, same layout under projects_dir) -- true for this
+    deployment, since encode_project_path's encoding has to match on both
+    sides for history to line up at all.
+
+    Best-effort in a stronger sense than sync_project_with_remote: a
+    missing history dir (no conversation yet, on either side) is the
+    common case, not a failure, so callers should treat any non-ok result
+    here as unremarkable rather than surfacing it as a warning."""
+    if not sync_enabled(cfg):
+        return SyncResult(True, "sync not configured", skipped=True)
+
+    encoded = encode_project_path(project_dir)
+    local_history = claude_history_dir(project_dir)
+    if direction == "push" and not os.path.isdir(local_history):
+        return SyncResult(True, "no local history yet", skipped=True)
+
+    os.makedirs(local_history, exist_ok=True)
+    remote_history = f"{cfg['sync_host']}:~/.claude/projects/{encoded}/"
+    local = local_history.rstrip("/") + "/"
+    src, dst = (remote_history, local) if direction == "pull" else (local, remote_history)
+
+    args = build_rsync_args(src, dst, cfg["sync_connect_timeout_seconds"])
+    return await _run_subprocess(args, cfg["sync_rsync_timeout_seconds"])
+
+
+async def has_remote_live_session(cfg: dict, project_name: str) -> str | None:
+    """Mirrors bridge/projects.py::has_live_session, but for the remote
+    host: returns the pid of a live `claude` process there with this
+    project as cwd, or None if there isn't one, sync is disabled, or the
+    remote can't be checked right now (fails open, like the rest of this
+    module -- an unreachable second host must never block message
+    handling).
+
+    This exists because history sync is not just a races risk: `claude
+    --continue` always resumes the most-recently-modified transcript in a
+    project's history, so pulling one in from a host with an actively
+    open interactive session there can silently hijack and continue that
+    live conversation instead of starting fresh -- discovered by actually
+    triggering it once. Callers must check this (and the local
+    has_live_session) before running any sync for a project, not just
+    before sending a message through it."""
+    if not sync_enabled(cfg):
+        return None
+
+    remote_dir = os.path.join(cfg["sync_remote_projects_dir"], project_name)
+    target = os.path.normpath(remote_dir)
+    shell_cmd = (
+        "for pid in $(pgrep -x claude); do "
+        'p="$(readlink -f /proc/$pid/cwd 2>/dev/null)"; '
+        '[ -n "$p" ] && echo "$pid:$p"; '
+        "done"
+    )
+    connect_timeout = cfg["sync_connect_timeout_seconds"]
+    args = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={connect_timeout}", cfg["sync_host"], shell_cmd]
+
+    result = await _run_subprocess(args, connect_timeout + 5)
+    if not result.ok:
+        return None
+
+    for line in result.stdout.splitlines():
+        pid, _, cwd = line.partition(":")
+        if cwd == target:
+            return pid
+    return None
+
+
 async def list_remote_only_projects(cfg: dict, local_names: set[str]) -> list[str]:
     """Names present under the remote projects_dir but not in local_names,
     excluding remote git repos. Returns [] on any failure/timeout -- a
@@ -153,9 +239,16 @@ async def list_remote_only_projects(cfg: dict, local_names: set[str]) -> list[st
 
 
 async def materialize_remote_project(cfg: dict, project_name: str, project_dir: str) -> SyncResult:
-    """One-time pull for a project that doesn't exist locally yet."""
+    """One-time pull for a project that doesn't exist locally yet.
+
+    Also pulls its Claude Code session history, if any, so a project used
+    interactively on the other host (but never before through the bridge)
+    keeps its conversation continuity from the very first message."""
     os.makedirs(project_dir, exist_ok=True)
     remote = remote_endpoint(cfg["sync_host"], cfg["sync_remote_projects_dir"], project_name)
     local = project_dir.rstrip("/") + "/"
     args = build_rsync_args(remote, local, cfg["sync_connect_timeout_seconds"])
-    return await _run_subprocess(args, FIRST_SYNC_TIMEOUT_SECONDS)
+    result = await _run_subprocess(args, FIRST_SYNC_TIMEOUT_SECONDS)
+
+    await sync_history_with_remote(cfg, project_dir, "pull")
+    return result

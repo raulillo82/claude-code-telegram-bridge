@@ -78,7 +78,10 @@ as a fallback for the narrow case where you don't.
    other is never wiped out) pulling from the second host before the message
    and pushing back after, and `/projects` also lists non-git projects that
    only exist on the second host (labeled "(remoto)"), copying one down on
-   first selection.
+   first selection. Separately (and regardless of whether the project itself
+   is git-managed), each project's Claude Code session history under
+   `~/.claude/projects/` is synced the same way, so `--continue` sees the
+   same conversation whichever host you last used.
 5. `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
 6. Run it directly for a quick test: `.venv/bin/python run.py`. For actual
    use, install it as a systemd user service instead (see below) — a
@@ -231,3 +234,7 @@ concluding the test passed or failed:
   non-git project directories. A project that only exists on the second
   host and is itself a git repo won't show up there — `git clone` it
   ahead of time as usual.
+- The check that refuses to sync a project while it has a live Claude Code
+  session on the other host fails open if that host can't be reached right
+  now (consistent with the rest of the sync feature never blocking on an
+  unreachable second host) — it catches the obvious case, not every race.

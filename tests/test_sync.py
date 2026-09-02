@@ -8,6 +8,7 @@ future test needing to fake an async subprocess (e.g. claude_runner.run_claude).
 """
 
 import asyncio
+import os
 
 from bridge import sync
 
@@ -162,7 +163,49 @@ def test_list_remote_only_projects_disabled(monkeypatch):
     assert result == []
 
 
+def test_has_remote_live_session_finds_matching_cwd(monkeypatch):
+    async def fake_exec(*args, **kwargs):
+        stdout = b"111:/remote/claude/other_proj\n222:/remote/claude/proj\n"
+        return FakeProc(returncode=0, stdout=stdout)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    cfg = make_cfg()
+    pid = asyncio.run(sync.has_remote_live_session(cfg, "proj"))
+    assert pid == "222"
+
+
+def test_has_remote_live_session_no_match(monkeypatch):
+    async def fake_exec(*args, **kwargs):
+        return FakeProc(returncode=0, stdout=b"111:/remote/claude/other_proj\n")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    cfg = make_cfg()
+    pid = asyncio.run(sync.has_remote_live_session(cfg, "proj"))
+    assert pid is None
+
+
+def test_has_remote_live_session_fails_open_on_unreachable_host(monkeypatch):
+    async def fake_exec(*args, **kwargs):
+        return FakeProc(returncode=255, stderr=b"connection failed")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    cfg = make_cfg()
+    pid = asyncio.run(sync.has_remote_live_session(cfg, "proj"))
+    assert pid is None
+
+
+def test_has_remote_live_session_disabled(monkeypatch):
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("no subprocess should run when sync is disabled")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_if_called)
+    cfg = make_cfg(sync_host=None)
+    pid = asyncio.run(sync.has_remote_live_session(cfg, "proj"))
+    assert pid is None
+
+
 def test_materialize_remote_project_creates_dir_then_pulls(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     project_dir = tmp_path / "new_proj"
     calls = []
 
@@ -174,5 +217,60 @@ def test_materialize_remote_project_creates_dir_then_pulls(tmp_path, monkeypatch
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     cfg = make_cfg()
     result = asyncio.run(sync.materialize_remote_project(cfg, "new_proj", str(project_dir)))
+    assert result.ok
+    # One rsync for the project content, one for its (likely nonexistent
+    # yet) Claude Code session history -- see test_sync_history_with_remote_*.
+    assert len(calls) == 2
+
+
+def test_claude_history_dir_matches_encode_project_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    from bridge.claude_runner import encode_project_path
+
+    project_dir = str(tmp_path / "proj")
+    expected = os.path.join(str(tmp_path / "home"), ".claude", "projects", encode_project_path(project_dir))
+    assert sync.claude_history_dir(project_dir) == expected
+
+
+def test_sync_history_with_remote_skips_push_when_no_local_history(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("nothing to push when no local history exists yet")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_if_called)
+    cfg = make_cfg()
+    result = asyncio.run(sync.sync_history_with_remote(cfg, str(tmp_path / "proj"), "push"))
+    assert result.ok
+    assert result.skipped
+
+
+def test_sync_history_with_remote_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("no subprocess should run when sync is disabled")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_if_called)
+    cfg = make_cfg(sync_host=None)
+    result = asyncio.run(sync.sync_history_with_remote(cfg, str(tmp_path / "proj"), "pull"))
+    assert result.ok
+    assert result.skipped
+
+
+def test_sync_history_with_remote_pull_creates_dir_and_runs(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    project_dir = str(tmp_path / "proj")
+    history_dir = sync.claude_history_dir(project_dir)
+    calls = []
+
+    async def fake_exec(*args, **kwargs):
+        calls.append(args)
+        assert os.path.isdir(history_dir)
+        return FakeProc(returncode=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    cfg = make_cfg()
+    result = asyncio.run(sync.sync_history_with_remote(cfg, project_dir, "pull"))
     assert result.ok
     assert len(calls) == 1

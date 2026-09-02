@@ -48,6 +48,29 @@
   other side yet (e.g. something the bridge itself just wrote). Deliberately
   never touches anything with a local or remote `.git` — mixing mtime-based
   file sync with git's own object store risks corrupting it.
+- Claude Code's own session history (what makes `--continue` work) lives
+  under `~/.claude/projects/<encoded-path>/`, entirely outside the project
+  directory — so it's invisible to both git and the rsync above, for every
+  project regardless of whether it's git-managed. Without syncing it too,
+  a conversation continued via the bridge on one host silently forks away
+  from what the other host's `--continue` sees. `sync.sync_history_with_remote`
+  covers this separately (same twice-per-message trigger, but applies
+  unconditionally since this directory is never itself a git repo).
+- History sync makes a live session on the *other* host dangerous in a way
+  it wasn't before: `claude --continue` always resumes the
+  most-recently-modified transcript in a project's history, so pulling one
+  in from a host with an actively open interactive session there can
+  hijack and continue that live conversation instead of starting fresh —
+  this actually happened once while testing (the bridge picked up and
+  replied inside a live, unrelated conversation transcript pulled from the
+  other host). `projects.has_live_session` already refused to send when a
+  `claude` process had the project open *locally*; `sync.has_remote_live_session`
+  extends the same check over SSH to the other host, and both
+  `handle_message` and the "(remoto)" materialization path in `on_button`
+  check it before running any sync. It fails open (treats an unreachable
+  host as "no live session there") to stay consistent with the rest of
+  this module's degrade-gracefully design — this is a best-effort guard
+  for the obvious case, not an airtight lock.
 
 ## Credentials
 
