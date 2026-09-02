@@ -28,6 +28,14 @@
   `default-cache-ttl`/`max-cache-ttl` as the previous host's, 28800/86400
   — a fresh `gpg-agent.conf` won't have these), and the `gpg-unlock` shell
   function from `~/.alias` copied over.
+- The systemd unit sets `Environment=PATH=...` explicitly including
+  `%h/.local/bin` — a systemd `--user` service's default PATH does not
+  include it, and that's exactly where `claude` is typically installed.
+  Without this, the service starts and polls fine (so `systemctl status`
+  looks healthy) but every actual message fails with `FileNotFoundError:
+  'claude'` the moment `run_claude` tries to spawn it — this went
+  unnoticed past an initial "does the service start" check during a host
+  migration, only surfacing on the first real end-to-end message test.
 
 ## Credentials
 
