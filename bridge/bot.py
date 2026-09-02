@@ -25,7 +25,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import permissions, projects
+from . import permissions, projects, sync
 from .claude_runner import run_claude
 from .history_preview import get_last_assistant_message
 from .state import BotState
@@ -86,6 +86,14 @@ def load_config() -> dict:
     # config.json, since that's an easy mistake to make by hand.
     cfg["allowed_user_id"] = int(cfg["allowed_user_id"])
     cfg["bot_token"] = _load_bot_token(cfg)
+    # Optional two-host sync of non-git projects (see bridge/sync.py) --
+    # absent sync_host means the feature is fully off.
+    cfg.setdefault("sync_host", None)
+    cfg["sync_remote_projects_dir"] = os.path.expanduser(
+        cfg.get("sync_remote_projects_dir") or cfg["projects_dir"]
+    )
+    cfg.setdefault("sync_connect_timeout_seconds", 5)
+    cfg.setdefault("sync_rsync_timeout_seconds", 120)
     return cfg
 
 
@@ -138,8 +146,10 @@ async def download_attachments(update: Update, context: ContextTypes.DEFAULT_TYP
     return [dest]
 
 
-def project_picker_markup(names: list[str]) -> InlineKeyboardMarkup:
+def project_picker_markup(names: list[str], remote_only: list[str] | None = None) -> InlineKeyboardMarkup:
     buttons = [[InlineKeyboardButton(n, callback_data=f"proj:{n}")] for n in names]
+    for n in remote_only or []:
+        buttons.append([InlineKeyboardButton(f"{n} (remoto)", callback_data=f"projrem:{n}")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -163,10 +173,13 @@ async def cmd_projects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not is_authorized(update, cfg["allowed_user_id"]):
         return
     names = projects.list_projects(cfg["projects_dir"])
-    if not names:
+    remote_only = await sync.list_remote_only_projects(cfg, set(names))
+    if not names and not remote_only:
         await update.message.reply_text(f"No projects found under {cfg['projects_dir']}")
         return
-    await update.message.reply_text("Pick a project:", reply_markup=project_picker_markup(names))
+    await update.message.reply_text(
+        "Pick a project:", reply_markup=project_picker_markup(names, remote_only)
+    )
 
 
 async def _run_claude_with_typing(
@@ -366,6 +379,29 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.edit_message_text(reply)
         return
 
+    if data.startswith("projrem:"):
+        name = data[len("projrem:") :]
+        if state.is_materializing(name):
+            await context.bot.send_message(chat_id, f"Already copying '{name}', hang on.")
+            return
+        project_dir = os.path.join(cfg["projects_dir"], name)
+        state.start_materializing(name)
+        await query.edit_message_text(f"Copying '{name}' from the other host...")
+        try:
+            result = await sync.materialize_remote_project(cfg, name, project_dir)
+        finally:
+            state.finish_materializing(name)
+        if not result.ok:
+            await context.bot.send_message(chat_id, f"Could not copy '{name}': {result.detail}")
+            return
+        state.set_active_project(chat_id, name)
+        preview = get_last_assistant_message(project_dir)
+        reply = f"Active project: {name}"
+        if preview:
+            reply += f"\n\nLast time you were here:\n{preview}"
+        await context.bot.send_message(chat_id, reply)
+        return
+
     if data == "create_no":
         state.pending_create.pop(chat_id, None)
         await query.edit_message_text("Cancelled.")
@@ -478,10 +514,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     mode = state.check_and_touch(chat_id, cfg["flight_mode_idle_minutes"])
     extra_args = permissions.build_claude_args(mode)
 
+    sync_warning = None
     typing_task = asyncio.create_task(_keep_typing(context.bot, chat_id))
     try:
         async with state.lock_for(resolved):
-            result = await run_claude(project_dir, text, extra_args)
+            pre = await sync.sync_project_with_remote(cfg, resolved, project_dir, "pull")
+            if not pre.ok and not pre.skipped:
+                sync_warning = f"(could not sync before: {pre.detail})"
+            try:
+                result = await run_claude(project_dir, text, extra_args)
+            finally:
+                post = await sync.sync_project_with_remote(cfg, resolved, project_dir, "push")
+                if not post.ok and not post.skipped:
+                    sync_warning = f"(could not sync after: {post.detail})"
     finally:
         typing_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -490,6 +535,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     reply = f"[{resolved}] {result.text}"
     if result.permission_denied and mode == "normal":
         reply += "\n\n(Looks like normal mode blocked something. Try /mode flight and resend if needed.)"
+    if sync_warning:
+        reply += f"\n\n{sync_warning}"
 
     await send_long_message(update, reply)
 

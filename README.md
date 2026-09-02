@@ -57,8 +57,30 @@ as a fallback for the narrow case where you don't.
    service below uses `Restart=always`, a crash after the key's cache
    expires means it will keep failing to restart until the key is
    unlocked again.
-4. `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
-5. Run it directly for a quick test: `.venv/bin/python run.py`. For actual
+4. Optional: two-way sync of non-git project directories with a second
+   host, useful if the bridge runs on a dedicated always-on machine while
+   your projects mostly live on a laptop that isn't always reachable. Only
+   applies to project directories without a `.git` subdirectory — git-backed
+   projects already self-sync via `git push`/`pull` and are left untouched.
+   Prerequisite: passwordless `ssh <host-alias>` already working from the
+   bridge's machine to the second host (an `~/.ssh/config` `Host` entry with
+   a passphrase-less key, or an agent) — this feature does not set up SSH
+   itself. Then add to `config.json`:
+   ```json
+   "sync_host": "my-second-host",
+   "sync_remote_projects_dir": "~/claude",
+   "sync_connect_timeout_seconds": 5,
+   "sync_rsync_timeout_seconds": 120
+   ```
+   Omit `sync_host` (or leave it empty) to disable the feature entirely — the
+   default. When enabled: each relayed message runs `rsync -au` (never
+   `--delete`, so a file created on one side that doesn't exist yet on the
+   other is never wiped out) pulling from the second host before the message
+   and pushing back after, and `/projects` also lists non-git projects that
+   only exist on the second host (labeled "(remoto)"), copying one down on
+   first selection.
+5. `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
+6. Run it directly for a quick test: `.venv/bin/python run.py`. For actual
    use, install it as a systemd user service instead (see below) — a
    foreground process tied to a terminal (or to someone else's shell
    session) dies the moment that session closes.
@@ -205,3 +227,7 @@ concluding the test passed or failed:
 - Attachment support covers photos and documents only.
 - The "detect a permission block and suggest flight mode" behavior is
   best-effort text matching on Claude's output, not a structured signal.
+- The second-host sync's "(remoto)" listing in `/projects` only covers
+  non-git project directories. A project that only exists on the second
+  host and is itself a git repo won't show up there — `git clone` it
+  ahead of time as usual.

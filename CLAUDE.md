@@ -36,6 +36,18 @@
   'claude'` the moment `run_claude` tries to spawn it — this went
   unnoticed past an initial "does the service start" check during a host
   migration, only surfacing on the first real end-to-end message test.
+- Most of the user's project directories are one-off, non-git scratch
+  dirs (only a handful are real git repos with a GitHub remote). Git-backed
+  projects self-sync via `git push`/`pull` and need nothing extra. The
+  non-git ones only ever exist on whichever host last touched them, which
+  matters now that the bridge runs somewhere other than the primary
+  laptop — `bridge/sync.py` covers that gap with `rsync -au` (see the
+  `sync_*` keys in `config.example.json`), pulled before and pushed after
+  each relayed message. Deliberately never `--delete`: a mirrored delete
+  could wipe out a file created on one side that doesn't exist on the
+  other side yet (e.g. something the bridge itself just wrote). Deliberately
+  never touches anything with a local or remote `.git` — mixing mtime-based
+  file sync with git's own object store risks corrupting it.
 
 ## Credentials
 
@@ -71,6 +83,6 @@
   it directly from `systemd-ask-password` without showing it to the
   assistant, and verify the service starts instead of asking it to confirm
   the value. The current token was rotated this way during the move to
-  the rpi4 (BotFather shown it only on the phone, piped straight into gpg
+  the Pi (BotFather shown it only on the phone, piped straight into gpg
   over an SSH session with input echo disabled) — it was never seen by a
   Claude session.
