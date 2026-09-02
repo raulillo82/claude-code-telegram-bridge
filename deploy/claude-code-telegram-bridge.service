@@ -5,6 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# `claude` typically lives in ~/.local/bin, which a systemd --user unit's
+# default PATH does not include -- without this, run_claude's subprocess
+# call fails with FileNotFoundError: 'claude'.
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 WorkingDirectory=%h/claude/claude-code-telegram-bridge
 ExecStart=%h/claude/claude-code-telegram-bridge/.venv/bin/python %h/claude/claude-code-telegram-bridge/run.py
 Restart=always
