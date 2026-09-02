@@ -3,5 +3,10 @@
   "bot_token": "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE",
   "allowed_user_id": 123456789,
   "projects_dir": "~/claude",
-  "flight_mode_idle_minutes": 30
+  "flight_mode_idle_minutes": 30,
+  "_sync_comment": "Optional: two-way sync of non-git project dirs with a second host over SSH (see README). Omit sync_host (or leave it empty) to disable this feature entirely.",
+  "sync_host": "",
+  "sync_remote_projects_dir": "~/claude",
+  "sync_connect_timeout_seconds": 5,
+  "sync_rsync_timeout_seconds": 120
 }

@@ -17,7 +17,12 @@ class BotState:
         self.mode: dict[int, str] = {}
         self.last_activity: dict[int, float] = {}
         self.pending_create: dict[int, str] = {}
+        # chat_id -> (resolved project name, message text) for a message
+        # blocked by a live session on the *other* host, kept until the
+        # user picks "Start new session" or "Cancel".
+        self.pending_new_session: dict[int, tuple[str, str]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self.materializing: set[str] = set()
 
     def get_active_project(self, chat_id: int) -> str | None:
         return self.active_project.get(chat_id)
@@ -48,3 +53,12 @@ class BotState:
         if project_name not in self._locks:
             self._locks[project_name] = asyncio.Lock()
         return self._locks[project_name]
+
+    def is_materializing(self, project_name: str) -> bool:
+        return project_name in self.materializing
+
+    def start_materializing(self, project_name: str) -> None:
+        self.materializing.add(project_name)
+
+    def finish_materializing(self, project_name: str) -> None:
+        self.materializing.discard(project_name)

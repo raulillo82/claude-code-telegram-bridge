@@ -36,6 +36,57 @@
   'claude'` the moment `run_claude` tries to spawn it — this went
   unnoticed past an initial "does the service start" check during a host
   migration, only surfacing on the first real end-to-end message test.
+- Most of the user's project directories are one-off, non-git scratch
+  dirs (only a handful are real git repos with a GitHub remote). Git-backed
+  projects self-sync via `git push`/`pull` and need nothing extra. The
+  non-git ones only ever exist on whichever host last touched them, which
+  matters now that the bridge runs somewhere other than the primary
+  laptop — `bridge/sync.py` covers that gap with `rsync -au` (see the
+  `sync_*` keys in `config.example.json`), pulled before and pushed after
+  each relayed message. Deliberately never `--delete`: a mirrored delete
+  could wipe out a file created on one side that doesn't exist on the
+  other side yet (e.g. something the bridge itself just wrote). Deliberately
+  never touches anything with a local or remote `.git` — mixing mtime-based
+  file sync with git's own object store risks corrupting it.
+- Claude Code's own session history (what makes `--continue` work) lives
+  under `~/.claude/projects/<encoded-path>/`, entirely outside the project
+  directory — so it's invisible to both git and the rsync above, for every
+  project regardless of whether it's git-managed. Without syncing it too,
+  a conversation continued via the bridge on one host silently forks away
+  from what the other host's `--continue` sees. `sync.sync_history_with_remote`
+  covers this separately (same twice-per-message trigger, but applies
+  unconditionally since this directory is never itself a git repo).
+- History sync makes a live session on the *other* host dangerous in a way
+  it wasn't before: `claude --continue` always resumes the
+  most-recently-modified transcript in a project's history, so pulling one
+  in from a host with an actively open interactive session there can
+  hijack and continue that live conversation instead of starting fresh —
+  this actually happened once while testing (the bridge picked up and
+  replied inside a live, unrelated conversation transcript pulled from the
+  other host). `projects.has_live_session` already refused to send when a
+  `claude` process had the project open *locally*; `sync.has_remote_live_session`
+  extends the same check over SSH to the other host, and both
+  `handle_message` and the "(remoto)" materialization path in `on_button`
+  check it before running any sync. It fails open (treats an unreachable
+  host as "no live session there") to stay consistent with the rest of
+  this module's degrade-gracefully design — this is a best-effort guard
+  for the obvious case, not an airtight lock.
+- Unlike a *local* live session (a hard block — that's an actual
+  concurrent-write hazard), a *remote* one offers a way through: "Start new
+  session" (`newsession:<project>` callback, `state.pending_new_session`)
+  runs `run_claude(..., force_new_session=True)` -- which skips `--continue`
+  regardless of what history exists locally, not just the remote one -- and
+  `skip_history_sync=True` in `_run_claude_with_sync`, so it can never pull
+  or push that project's history while the block is in effect. This is
+  deliberately a real fork, not a merge: the resulting conversation is a
+  separate, fresh session that stays local until the other host's session
+  ends and normal history sync resumes, at which point both transcripts
+  end up on both hosts as distinct files (no filename collision, since
+  each session is its own UUID) -- but `claude --continue` run by hand
+  afterward will resume whichever one has the latest mtime, which may not
+  be the one the user expects. No local-vs-remote distinction needed for
+  the "(remoto)" materialization path's equivalent check, since that one
+  has no local session to fall back to at all -- it's a hard block there.
 
 ## Credentials
 
@@ -71,6 +122,6 @@
   it directly from `systemd-ask-password` without showing it to the
   assistant, and verify the service starts instead of asking it to confirm
   the value. The current token was rotated this way during the move to
-  the rpi4 (BotFather shown it only on the phone, piped straight into gpg
+  the Pi (BotFather shown it only on the phone, piped straight into gpg
   over an SSH session with input echo disabled) — it was never seen by a
   Claude session.

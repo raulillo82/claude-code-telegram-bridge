@@ -3,7 +3,7 @@ import subprocess
 
 import pytest
 
-from bridge import bot
+from bridge import bot, sync
 
 
 def write_config(tmp_path, allowed_user_id, bot_token="dummy"):
@@ -65,3 +65,12 @@ def test_load_config_raises_when_no_token_available(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "BOT_TOKEN_GPG_PATH", tmp_path / "missing.gpg")
     with pytest.raises(RuntimeError):
         bot.load_config()
+
+
+def test_load_config_sync_disabled_when_absent(tmp_path, monkeypatch):
+    """A config predating the sync feature (or one that just never opted
+    in) must leave it fully off -- no forced changes to existing configs."""
+    monkeypatch.setattr(bot, "CONFIG_PATH", write_config(tmp_path, 7626037))
+    cfg = bot.load_config()
+    assert cfg["sync_host"] is None
+    assert sync.sync_enabled(cfg) is False

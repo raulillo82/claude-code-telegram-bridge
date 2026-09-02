@@ -25,7 +25,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import permissions, projects
+from . import permissions, projects, sync
 from .claude_runner import run_claude
 from .history_preview import get_last_assistant_message
 from .state import BotState
@@ -86,6 +86,14 @@ def load_config() -> dict:
     # config.json, since that's an easy mistake to make by hand.
     cfg["allowed_user_id"] = int(cfg["allowed_user_id"])
     cfg["bot_token"] = _load_bot_token(cfg)
+    # Optional two-host sync of non-git projects (see bridge/sync.py) --
+    # absent sync_host means the feature is fully off.
+    cfg.setdefault("sync_host", None)
+    cfg["sync_remote_projects_dir"] = os.path.expanduser(
+        cfg.get("sync_remote_projects_dir") or cfg["projects_dir"]
+    )
+    cfg.setdefault("sync_connect_timeout_seconds", 5)
+    cfg.setdefault("sync_rsync_timeout_seconds", 120)
     return cfg
 
 
@@ -138,8 +146,10 @@ async def download_attachments(update: Update, context: ContextTypes.DEFAULT_TYP
     return [dest]
 
 
-def project_picker_markup(names: list[str]) -> InlineKeyboardMarkup:
+def project_picker_markup(names: list[str], remote_only: list[str] | None = None) -> InlineKeyboardMarkup:
     buttons = [[InlineKeyboardButton(n, callback_data=f"proj:{n}")] for n in names]
+    for n in remote_only or []:
+        buttons.append([InlineKeyboardButton(f"{n} (remoto)", callback_data=f"projrem:{n}")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -163,10 +173,13 @@ async def cmd_projects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not is_authorized(update, cfg["allowed_user_id"]):
         return
     names = projects.list_projects(cfg["projects_dir"])
-    if not names:
+    remote_only = await sync.list_remote_only_projects(cfg, set(names))
+    if not names and not remote_only:
         await update.message.reply_text(f"No projects found under {cfg['projects_dir']}")
         return
-    await update.message.reply_text("Pick a project:", reply_markup=project_picker_markup(names))
+    await update.message.reply_text(
+        "Pick a project:", reply_markup=project_picker_markup(names, remote_only)
+    )
 
 
 async def _run_claude_with_typing(
@@ -186,6 +199,51 @@ async def _run_claude_with_typing(
         typing_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await typing_task
+
+
+async def _run_claude_with_sync(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    cfg: dict,
+    resolved: str,
+    project_dir: str,
+    text: str,
+    extra_args: list[str],
+    *,
+    force_new_session: bool = False,
+    skip_history_sync: bool = False,
+):
+    """Like _run_claude_with_typing, but also wraps the two-host content
+    sync (always) and history sync (unless skip_history_sync -- used by
+    the "Start new session" override, which must never pull a live
+    session's transcript in from the other host). Returns (ClaudeResult,
+    sync_warning), where sync_warning is a user-facing string or None."""
+    state: BotState = context.bot_data["state"]
+    sync_warning = None
+    typing_task = asyncio.create_task(_keep_typing(context.bot, chat_id))
+    try:
+        async with state.lock_for(resolved):
+            pre = await sync.sync_project_with_remote(cfg, resolved, project_dir, "pull")
+            if not pre.ok and not pre.skipped:
+                sync_warning = f"(could not sync before: {pre.detail})"
+            # Session history sync is best-effort in a stronger sense: "no
+            # history yet" is the common case, not a failure, so it never
+            # contributes to sync_warning.
+            if not skip_history_sync:
+                await sync.sync_history_with_remote(cfg, project_dir, "pull")
+            try:
+                result = await run_claude(project_dir, text, extra_args, force_new_session=force_new_session)
+            finally:
+                post = await sync.sync_project_with_remote(cfg, resolved, project_dir, "push")
+                if not post.ok and not post.skipped:
+                    sync_warning = f"(could not sync after: {post.detail})"
+                if not skip_history_sync:
+                    await sync.sync_history_with_remote(cfg, project_dir, "push")
+    finally:
+        typing_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await typing_task
+    return result, sync_warning
 
 
 async def _resolve_active_project_for_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -366,6 +424,37 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.edit_message_text(reply)
         return
 
+    if data.startswith("projrem:"):
+        name = data[len("projrem:") :]
+        if state.is_materializing(name):
+            await context.bot.send_message(chat_id, f"Already copying '{name}', hang on.")
+            return
+        live_pid = await sync.has_remote_live_session(cfg, name)
+        if live_pid:
+            await context.bot.send_message(
+                chat_id,
+                f"There is a live Claude Code session on '{name}' on the other host "
+                f"(pid {live_pid}). Not copying it over right now.",
+            )
+            return
+        project_dir = os.path.join(cfg["projects_dir"], name)
+        state.start_materializing(name)
+        await query.edit_message_text(f"Copying '{name}' from the other host...")
+        try:
+            result = await sync.materialize_remote_project(cfg, name, project_dir)
+        finally:
+            state.finish_materializing(name)
+        if not result.ok:
+            await context.bot.send_message(chat_id, f"Could not copy '{name}': {result.detail}")
+            return
+        state.set_active_project(chat_id, name)
+        preview = get_last_assistant_message(project_dir)
+        reply = f"Active project: {name}"
+        if preview:
+            reply += f"\n\nLast time you were here:\n{preview}"
+        await context.bot.send_message(chat_id, reply)
+        return
+
     if data == "create_no":
         state.pending_create.pop(chat_id, None)
         await query.edit_message_text("Cancelled.")
@@ -380,6 +469,35 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.edit_message_text(
             f"Created '{name}' and set it active. Send your message again."
         )
+        return
+
+    if data == "newsession_no":
+        state.pending_new_session.pop(chat_id, None)
+        await query.edit_message_text("Cancelled.")
+        return
+
+    if data.startswith("newsession:"):
+        name = data[len("newsession:") :]
+        pending = state.pending_new_session.pop(chat_id, None)
+        if pending is None or pending[0] != name:
+            await query.edit_message_text("That request has expired. Send the message again.")
+            return
+        _, text = pending
+        project_dir = os.path.join(cfg["projects_dir"], name)
+        mode = state.check_and_touch(chat_id, cfg["flight_mode_idle_minutes"])
+        extra_args = permissions.build_claude_args(mode)
+        await query.edit_message_text(f"[{name}] Starting a new session...")
+        result, sync_warning = await _run_claude_with_sync(
+            context, chat_id, cfg, name, project_dir, text, extra_args,
+            force_new_session=True, skip_history_sync=True,
+        )
+        reply = f"[{name}] {result.text}"
+        if result.permission_denied and mode == "normal":
+            reply += "\n\n(Looks like normal mode blocked something. Try /mode flight and resend if needed.)"
+        if sync_warning:
+            reply += f"\n\n{sync_warning}"
+        for i in range(0, len(reply), TELEGRAM_MAX_CHARS):
+            await context.bot.send_message(chat_id, reply[i : i + TELEGRAM_MAX_CHARS])
         return
 
     if data == "clear_no":
@@ -467,6 +585,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
+    if sync.sync_enabled(cfg):
+        # A live session on the *other* host is not just a races risk here:
+        # history sync would pull in its transcript, and --continue always
+        # resumes the most-recently-modified one, so it could hijack and
+        # continue that live conversation instead of starting fresh. Unlike
+        # a local live session, this is offered a way around it, since the
+        # user may have no other way to reach that host right now (e.g.
+        # mid-flight) to close the session themselves.
+        remote_pid = await sync.has_remote_live_session(cfg, resolved)
+        if remote_pid:
+            state.pending_new_session[chat_id] = (resolved, text)
+            markup = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("Start new session", callback_data=f"newsession:{resolved}"),
+                        InlineKeyboardButton("Cancel", callback_data="newsession_no"),
+                    ]
+                ]
+            )
+            await update.message.reply_text(
+                f"[{resolved}] There is a live Claude Code session on this project on the "
+                f"other host (pid {remote_pid}). Syncing now could hijack that conversation. "
+                "Start a fresh, separate session here instead?",
+                reply_markup=markup,
+            )
+            return
+
     attachment_paths = await download_attachments(update, context, project_dir)
     if attachment_paths:
         text = (text + "\n\nAttached files:\n" + "\n".join(attachment_paths)).strip()
@@ -478,18 +623,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     mode = state.check_and_touch(chat_id, cfg["flight_mode_idle_minutes"])
     extra_args = permissions.build_claude_args(mode)
 
-    typing_task = asyncio.create_task(_keep_typing(context.bot, chat_id))
-    try:
-        async with state.lock_for(resolved):
-            result = await run_claude(project_dir, text, extra_args)
-    finally:
-        typing_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await typing_task
+    result, sync_warning = await _run_claude_with_sync(
+        context, chat_id, cfg, resolved, project_dir, text, extra_args
+    )
 
     reply = f"[{resolved}] {result.text}"
     if result.permission_denied and mode == "normal":
         reply += "\n\n(Looks like normal mode blocked something. Try /mode flight and resend if needed.)"
+    if sync_warning:
+        reply += f"\n\n{sync_warning}"
 
     await send_long_message(update, reply)
 

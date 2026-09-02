@@ -75,9 +75,10 @@ async def run_claude(
     prompt: str,
     extra_args: list[str],
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    force_new_session: bool = False,
 ) -> ClaudeResult:
     args = ["claude", "-p", prompt, "--output-format", "json"]
-    if has_prior_history(project_dir):
+    if not force_new_session and has_prior_history(project_dir):
         args.append("--continue")
     args.extend(extra_args)
 
