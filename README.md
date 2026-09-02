@@ -81,7 +81,12 @@ as a fallback for the narrow case where you don't.
    first selection. Separately (and regardless of whether the project itself
    is git-managed), each project's Claude Code session history under
    `~/.claude/projects/` is synced the same way, so `--continue` sees the
-   same conversation whichever host you last used.
+   same conversation whichever host you last used. If that project has a
+   live Claude Code session open on the other host right now, the bridge
+   won't send your message (syncing its history could hijack that live
+   conversation) — instead it offers "Start new session" (a fresh,
+   separate conversation, kept apart until the other session ends and
+   syncing resumes) or "Cancel".
 5. `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
 6. Run it directly for a quick test: `.venv/bin/python run.py`. For actual
    use, install it as a systemd user service instead (see below) — a

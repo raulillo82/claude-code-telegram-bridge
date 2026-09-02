@@ -17,6 +17,10 @@ class BotState:
         self.mode: dict[int, str] = {}
         self.last_activity: dict[int, float] = {}
         self.pending_create: dict[int, str] = {}
+        # chat_id -> (resolved project name, message text) for a message
+        # blocked by a live session on the *other* host, kept until the
+        # user picks "Start new session" or "Cancel".
+        self.pending_new_session: dict[int, tuple[str, str]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self.materializing: set[str] = set()
 

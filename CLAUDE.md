@@ -71,6 +71,22 @@
   host as "no live session there") to stay consistent with the rest of
   this module's degrade-gracefully design — this is a best-effort guard
   for the obvious case, not an airtight lock.
+- Unlike a *local* live session (a hard block — that's an actual
+  concurrent-write hazard), a *remote* one offers a way through: "Start new
+  session" (`newsession:<project>` callback, `state.pending_new_session`)
+  runs `run_claude(..., force_new_session=True)` -- which skips `--continue`
+  regardless of what history exists locally, not just the remote one -- and
+  `skip_history_sync=True` in `_run_claude_with_sync`, so it can never pull
+  or push that project's history while the block is in effect. This is
+  deliberately a real fork, not a merge: the resulting conversation is a
+  separate, fresh session that stays local until the other host's session
+  ends and normal history sync resumes, at which point both transcripts
+  end up on both hosts as distinct files (no filename collision, since
+  each session is its own UUID) -- but `claude --continue` run by hand
+  afterward will resume whichever one has the latest mtime, which may not
+  be the one the user expects. No local-vs-remote distinction needed for
+  the "(remoto)" materialization path's equivalent check, since that one
+  has no local session to fall back to at all -- it's a hard block there.
 
 ## Credentials
 

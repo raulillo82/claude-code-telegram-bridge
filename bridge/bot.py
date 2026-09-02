@@ -201,6 +201,51 @@ async def _run_claude_with_typing(
             await typing_task
 
 
+async def _run_claude_with_sync(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    cfg: dict,
+    resolved: str,
+    project_dir: str,
+    text: str,
+    extra_args: list[str],
+    *,
+    force_new_session: bool = False,
+    skip_history_sync: bool = False,
+):
+    """Like _run_claude_with_typing, but also wraps the two-host content
+    sync (always) and history sync (unless skip_history_sync -- used by
+    the "Start new session" override, which must never pull a live
+    session's transcript in from the other host). Returns (ClaudeResult,
+    sync_warning), where sync_warning is a user-facing string or None."""
+    state: BotState = context.bot_data["state"]
+    sync_warning = None
+    typing_task = asyncio.create_task(_keep_typing(context.bot, chat_id))
+    try:
+        async with state.lock_for(resolved):
+            pre = await sync.sync_project_with_remote(cfg, resolved, project_dir, "pull")
+            if not pre.ok and not pre.skipped:
+                sync_warning = f"(could not sync before: {pre.detail})"
+            # Session history sync is best-effort in a stronger sense: "no
+            # history yet" is the common case, not a failure, so it never
+            # contributes to sync_warning.
+            if not skip_history_sync:
+                await sync.sync_history_with_remote(cfg, project_dir, "pull")
+            try:
+                result = await run_claude(project_dir, text, extra_args, force_new_session=force_new_session)
+            finally:
+                post = await sync.sync_project_with_remote(cfg, resolved, project_dir, "push")
+                if not post.ok and not post.skipped:
+                    sync_warning = f"(could not sync after: {post.detail})"
+                if not skip_history_sync:
+                    await sync.sync_history_with_remote(cfg, project_dir, "push")
+    finally:
+        typing_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await typing_task
+    return result, sync_warning
+
+
 async def _resolve_active_project_for_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Resolve the chat's active project for /compact and /clear.
 
@@ -426,6 +471,35 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    if data == "newsession_no":
+        state.pending_new_session.pop(chat_id, None)
+        await query.edit_message_text("Cancelled.")
+        return
+
+    if data.startswith("newsession:"):
+        name = data[len("newsession:") :]
+        pending = state.pending_new_session.pop(chat_id, None)
+        if pending is None or pending[0] != name:
+            await query.edit_message_text("That request has expired. Send the message again.")
+            return
+        _, text = pending
+        project_dir = os.path.join(cfg["projects_dir"], name)
+        mode = state.check_and_touch(chat_id, cfg["flight_mode_idle_minutes"])
+        extra_args = permissions.build_claude_args(mode)
+        await query.edit_message_text(f"[{name}] Starting a new session...")
+        result, sync_warning = await _run_claude_with_sync(
+            context, chat_id, cfg, name, project_dir, text, extra_args,
+            force_new_session=True, skip_history_sync=True,
+        )
+        reply = f"[{name}] {result.text}"
+        if result.permission_denied and mode == "normal":
+            reply += "\n\n(Looks like normal mode blocked something. Try /mode flight and resend if needed.)"
+        if sync_warning:
+            reply += f"\n\n{sync_warning}"
+        for i in range(0, len(reply), TELEGRAM_MAX_CHARS):
+            await context.bot.send_message(chat_id, reply[i : i + TELEGRAM_MAX_CHARS])
+        return
+
     if data == "clear_no":
         await query.edit_message_text("Cancelled.")
         return
@@ -503,12 +577,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     project_dir = os.path.join(cfg["projects_dir"], resolved)
 
     live_pid = projects.has_live_session(project_dir)
-    if not live_pid and sync.sync_enabled(cfg):
-        # A live session on the *other* host is not just a races risk here:
-        # history sync would pull in its transcript, and --continue always
-        # resumes the most-recently-modified one, so it could hijack and
-        # continue that live conversation instead of starting fresh.
-        live_pid = await sync.has_remote_live_session(cfg, resolved)
     if live_pid:
         await update.message.reply_text(
             f"[{resolved}] There is already a live Claude Code session on this project "
@@ -516,6 +584,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "two processes writing to the same project at once."
         )
         return
+
+    if sync.sync_enabled(cfg):
+        # A live session on the *other* host is not just a races risk here:
+        # history sync would pull in its transcript, and --continue always
+        # resumes the most-recently-modified one, so it could hijack and
+        # continue that live conversation instead of starting fresh. Unlike
+        # a local live session, this is offered a way around it, since the
+        # user may have no other way to reach that host right now (e.g.
+        # mid-flight) to close the session themselves.
+        remote_pid = await sync.has_remote_live_session(cfg, resolved)
+        if remote_pid:
+            state.pending_new_session[chat_id] = (resolved, text)
+            markup = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("Start new session", callback_data=f"newsession:{resolved}"),
+                        InlineKeyboardButton("Cancel", callback_data="newsession_no"),
+                    ]
+                ]
+            )
+            await update.message.reply_text(
+                f"[{resolved}] There is a live Claude Code session on this project on the "
+                f"other host (pid {remote_pid}). Syncing now could hijack that conversation. "
+                "Start a fresh, separate session here instead?",
+                reply_markup=markup,
+            )
+            return
 
     attachment_paths = await download_attachments(update, context, project_dir)
     if attachment_paths:
@@ -528,28 +623,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     mode = state.check_and_touch(chat_id, cfg["flight_mode_idle_minutes"])
     extra_args = permissions.build_claude_args(mode)
 
-    sync_warning = None
-    typing_task = asyncio.create_task(_keep_typing(context.bot, chat_id))
-    try:
-        async with state.lock_for(resolved):
-            pre = await sync.sync_project_with_remote(cfg, resolved, project_dir, "pull")
-            if not pre.ok and not pre.skipped:
-                sync_warning = f"(could not sync before: {pre.detail})"
-            # Session history sync is best-effort in a stronger sense: "no
-            # history yet" is the common case, not a failure, so it never
-            # contributes to sync_warning.
-            await sync.sync_history_with_remote(cfg, project_dir, "pull")
-            try:
-                result = await run_claude(project_dir, text, extra_args)
-            finally:
-                post = await sync.sync_project_with_remote(cfg, resolved, project_dir, "push")
-                if not post.ok and not post.skipped:
-                    sync_warning = f"(could not sync after: {post.detail})"
-                await sync.sync_history_with_remote(cfg, project_dir, "push")
-    finally:
-        typing_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await typing_task
+    result, sync_warning = await _run_claude_with_sync(
+        context, chat_id, cfg, resolved, project_dir, text, extra_args
+    )
 
     reply = f"[{resolved}] {result.text}"
     if result.permission_denied and mode == "normal":
