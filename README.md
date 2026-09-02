@@ -40,6 +40,23 @@ as a fallback for the narrow case where you don't.
    `allowed_user_id`, and `projects_dir` (the parent directory holding your
    Claude Code project folders). `config.json` is gitignored — never commit
    it.
+
+   As an alternative to putting `bot_token` in `config.json`, you can omit
+   it there and instead store it GPG-encrypted at
+   `~/.credentials/telegram-bot-token.gpg`:
+   ```
+   systemd-ask-password "Telegram bot token: " | \
+       gpg --encrypt --recipient <your-key-id> --armor \
+       -o ~/.credentials/telegram-bot-token.gpg
+   chmod 600 ~/.credentials/telegram-bot-token.gpg
+   ```
+   The bridge decrypts it on startup (falling back to `config.json`'s
+   `bot_token` if set, so this is opt-in). This needs your GPG key
+   unlocked/cached in `gpg-agent` at the time the bridge starts — if it
+   isn't, startup fails asking for one or the other. Since the systemd
+   service below uses `Restart=always`, a crash after the key's cache
+   expires means it will keep failing to restart until the key is
+   unlocked again.
 4. `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
 5. Run it directly for a quick test: `.venv/bin/python run.py`. For actual
    use, install it as a systemd user service instead (see below) — a
