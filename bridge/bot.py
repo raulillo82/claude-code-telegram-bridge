@@ -11,6 +11,7 @@ import contextlib
 import json
 import logging
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -32,9 +33,14 @@ from .state import BotState
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
 )
+# httpx logs the full request URL at INFO, which for Telegram's API includes
+# the bot token (https://api.telegram.org/bot<TOKEN>/...) -- keep it out of
+# the journal.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
+BOT_TOKEN_GPG_PATH = Path.home() / ".credentials" / "telegram-bot-token.gpg"
 TELEGRAM_MAX_CHARS = 4000
 
 BOT_COMMANDS = [
@@ -46,6 +52,31 @@ BOT_COMMANDS = [
 ]
 
 
+def _load_bot_token(cfg: dict) -> str:
+    """Resolve the bot token, preferring the centralized encrypted store.
+
+    config.json's own "bot_token" (if set) still wins, for anyone who
+    hasn't adopted the ~/.credentials/*.gpg convention. Otherwise decrypt
+    it from there, which requires the user's GPG key to be unlocked
+    (see the "Firma de commits" section of the global CLAUDE.md / `gpg-unlock`).
+    """
+    token = cfg.get("bot_token")
+    if token:
+        return token
+    if not BOT_TOKEN_GPG_PATH.exists():
+        raise RuntimeError(
+            "No bot_token in config.json and no encrypted token at "
+            f"{BOT_TOKEN_GPG_PATH}. Set one or the other."
+        )
+    result = subprocess.run(
+        ["gpg", "--decrypt", str(BOT_TOKEN_GPG_PATH)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
 def load_config() -> dict:
     with open(CONFIG_PATH, encoding="utf-8") as f:
         cfg = json.load(f)
@@ -54,6 +85,7 @@ def load_config() -> dict:
     # update.effective_user.id; tolerate it being quoted as a string in
     # config.json, since that's an easy mistake to make by hand.
     cfg["allowed_user_id"] = int(cfg["allowed_user_id"])
+    cfg["bot_token"] = _load_bot_token(cfg)
     return cfg
 
 

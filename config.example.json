@@ -1,4 +1,5 @@
 {
+  "_bot_token_comment": "Omit bot_token entirely to load it from ~/.credentials/telegram-bot-token.gpg instead (see README) -- set it here only if you don't use that convention.",
   "bot_token": "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE",
   "allowed_user_id": 123456789,
   "projects_dir": "~/claude",
