@@ -37,8 +37,7 @@
   unnoticed past an initial "does the service start" check during a host
   migration, only surfacing on the first real end-to-end message test.
 - Most of the user's project directories are one-off, non-git scratch
-  dirs (only a handful are real git repos with a GitHub remote). Git-backed
-  projects self-sync via `git push`/`pull` and need nothing extra. The
+  dirs (only a handful are real git repos with a GitHub remote). The
   non-git ones only ever exist on whichever host last touched them, which
   matters now that the bridge runs somewhere other than the primary
   laptop — `bridge/sync.py` covers that gap with `rsync -au` (see the
@@ -48,6 +47,20 @@
   other side yet (e.g. something the bridge itself just wrote). Deliberately
   never touches anything with a local or remote `.git` — mixing mtime-based
   file sync with git's own object store risks corrupting it.
+- Git-backed projects don't need `sync.py`'s rsync, but they weren't
+  self-updating either -- nothing pulled a project's own git remote before
+  invoking it, so a project cloned onto a second host could silently run
+  against a stale checkout unless Claude happened to `git pull` on its own
+  initiative mid-conversation. `bridge/git_sync.py` covers this separately,
+  same twice-per-message trigger: `pull()` runs `git pull --ff-only`
+  before, `push_if_ahead()` runs `git push` after (only if HEAD is ahead of
+  its upstream — checked via `git rev-list --count @{u}..HEAD`, itself
+  skipped/treated as a no-op if there's no upstream configured at all).
+  Independent of the `sync_host` feature entirely (no config flag, always
+  on for any project with a `.git`) — safer by construction than the rsync
+  path since git already refuses instead of guessing when it can't cleanly
+  fast-forward, so there's no live-session hijack risk to guard against
+  here the way there is for history sync.
 - Claude Code's own session history (what makes `--continue` work) lives
   under `~/.claude/projects/<encoded-path>/`, entirely outside the project
   directory — so it's invisible to both git and the rsync above, for every
