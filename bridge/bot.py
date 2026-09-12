@@ -25,7 +25,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import permissions, projects, sync
+from . import git_sync, permissions, projects, sync
 from .claude_runner import run_claude
 from .history_preview import get_last_assistant_message
 from .state import BotState
@@ -216,8 +216,11 @@ async def _run_claude_with_sync(
     """Like _run_claude_with_typing, but also wraps the two-host content
     sync (always) and history sync (unless skip_history_sync -- used by
     the "Start new session" override, which must never pull a live
-    session's transcript in from the other host). Returns (ClaudeResult,
-    sync_warning), where sync_warning is a user-facing string or None."""
+    session's transcript in from the other host), plus a plain `git
+    pull --ff-only`/`git push` around git-managed projects (independent
+    of the two-host feature -- runs regardless of sync_host). Returns
+    (ClaudeResult, sync_warning), where sync_warning is a user-facing
+    string or None."""
     state: BotState = context.bot_data["state"]
     sync_warning = None
     typing_task = asyncio.create_task(_keep_typing(context.bot, chat_id))
@@ -231,6 +234,9 @@ async def _run_claude_with_sync(
             # contributes to sync_warning.
             if not skip_history_sync:
                 await sync.sync_history_with_remote(cfg, project_dir, "pull")
+            git_pull = await git_sync.pull(project_dir)
+            if not git_pull.ok and not git_pull.skipped:
+                sync_warning = f"(could not git pull: {git_pull.detail})"
             try:
                 result = await run_claude(project_dir, text, extra_args, force_new_session=force_new_session)
             finally:
@@ -239,6 +245,9 @@ async def _run_claude_with_sync(
                     sync_warning = f"(could not sync after: {post.detail})"
                 if not skip_history_sync:
                     await sync.sync_history_with_remote(cfg, project_dir, "push")
+                git_push = await git_sync.push_if_ahead(project_dir)
+                if not git_push.ok and not git_push.skipped:
+                    sync_warning = f"(could not git push: {git_push.detail})"
     finally:
         typing_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):

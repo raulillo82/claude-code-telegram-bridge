@@ -23,6 +23,10 @@ as a fallback for the narrow case where you don't.
 - Before relaying, it checks whether a `claude` process (interactive or
   not) already has that project directory as its cwd, and refuses to send
   if so — to avoid two processes writing to the same working tree at once.
+- If the target project has a git remote, it runs `git pull --ff-only`
+  before relaying and `git push` after (only if there's something new to
+  push) — always on, no configuration needed, independent of the
+  second-host sync described below.
 
 ## Setup
 
