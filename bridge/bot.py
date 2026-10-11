@@ -135,6 +135,9 @@ def load_config() -> dict:
     )
     cfg.setdefault("sync_connect_timeout_seconds", 5)
     cfg.setdefault("sync_rsync_timeout_seconds", 120)
+    # Hosts a remote-only git project may be cloned from (see
+    # sync.is_allowed_clone_url).
+    cfg.setdefault("sync_git_clone_hosts", ["github.com"])
     return cfg
 
 
@@ -187,10 +190,16 @@ async def download_attachments(update: Update, context: ContextTypes.DEFAULT_TYP
     return [dest]
 
 
-def project_picker_markup(names: list[str], remote_only: list[str] | None = None) -> InlineKeyboardMarkup:
+def project_picker_markup(
+    names: list[str],
+    remote_only: list[str] | None = None,
+    remote_git: list[str] | None = None,
+) -> InlineKeyboardMarkup:
     buttons = [[InlineKeyboardButton(n, callback_data=f"proj:{n}")] for n in names]
     for n in remote_only or []:
         buttons.append([InlineKeyboardButton(f"{n} (remoto)", callback_data=f"projrem:{n}")])
+    for n in remote_git or []:
+        buttons.append([InlineKeyboardButton(f"{n} (remoto, git)", callback_data=f"projgit:{n}")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -214,12 +223,12 @@ async def cmd_projects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not is_authorized(update, cfg["allowed_user_id"]):
         return
     names = projects.list_projects(cfg["projects_dir"])
-    remote_only = await sync.list_remote_only_projects(cfg, set(names))
-    if not names and not remote_only:
+    remote_only, remote_git = await sync.list_remote_only(cfg, set(names))
+    if not names and not remote_only and not remote_git:
         await update.message.reply_text(f"No projects found under {cfg['projects_dir']}")
         return
     await update.message.reply_text(
-        "Pick a project:", reply_markup=project_picker_markup(names, remote_only)
+        "Pick a project:", reply_markup=project_picker_markup(names, remote_only, remote_git)
     )
 
 
@@ -503,6 +512,44 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if preview:
             reply += f"\n\nLast time you were here:\n{preview}"
         await context.bot.send_message(chat_id, reply)
+        return
+
+    if data.startswith("projgit:"):
+        name = data[len("projgit:") :]
+        if state.is_materializing(name):
+            await context.bot.send_message(chat_id, f"Already cloning '{name}', hang on.")
+            return
+        # Cloning doesn't touch the other host's working tree, but it does
+        # pull that project's session history, which a live session there
+        # makes unsafe for the same reason as in "projrem:" above.
+        live_pid = await sync.has_remote_live_session(cfg, name)
+        if live_pid:
+            await context.bot.send_message(
+                chat_id,
+                f"There is a live Claude Code session on '{name}' on the other host "
+                f"(pid {live_pid}). Not cloning it right now.",
+            )
+            return
+        project_dir = os.path.join(cfg["projects_dir"], name)
+        state.start_materializing(name)
+        await query.edit_message_text(f"Cloning '{name}' from its git remote...")
+        try:
+            result, notes = await sync.materialize_remote_git_project(cfg, name, project_dir)
+        finally:
+            state.finish_materializing(name)
+        if not result.ok:
+            await context.bot.send_message(chat_id, f"Could not clone '{name}': {result.detail}")
+            return
+        state.set_active_project(chat_id, name)
+        reply = f"Active project: {name} (cloned from its git remote)"
+        if notes:
+            reply += "\n\nNot included, still only on the other host:\n" + "\n".join(
+                f"- {note}" for note in notes
+            )
+        preview = get_last_assistant_message(project_dir)
+        if preview:
+            reply += f"\n\nLast time you were here:\n{preview}"
+        await context.bot.send_message(chat_id, reply[:TELEGRAM_MAX_CHARS])
         return
 
     if data == "create_no":

@@ -19,6 +19,9 @@ routine condition, not an error.
 import asyncio
 import logging
 import os
+import re
+import shlex
+import shutil
 
 from .claude_runner import encode_project_path
 
@@ -72,21 +75,40 @@ def build_remote_listing_command(remote_dir: str) -> str:
     """Shell one-liner run on the remote host: one "name\\tgit|nogit" line
     per top-level directory under remote_dir. Plain `*/` globbing already
     skips dotdirs (no dotglob), matching bridge/projects.py's local
-    behavior of ignoring names starting with '.'."""
+    behavior of ignoring names starting with '.'. Git repos get a third
+    field, their `origin` URL (empty if they have none), which is what
+    decides whether they can be offered for cloning."""
     return (
         f'for d in "{remote_dir}"/*/; do '
         f'n=$(basename "$d"); '
-        f'[ -d "$d.git" ] && echo "$n\tgit" || echo "$n\tnogit"; '
+        f'[ -d "$d.git" ] '
+        f'&& echo "$n\tgit\t$(git -C "$d" remote get-url origin 2>/dev/null)" '
+        f'|| echo "$n\tnogit"; '
         f"done"
     )
 
 
-async def _run_subprocess(args: list[str], timeout: int) -> SyncResult:
+# The clone URL of a remote-only git project is read from the other host
+# and then handed to `git clone` with this host's own credentials, so it is
+# treated as untrusted input: only the scp-like SSH form, only on an
+# allowlisted host, and nothing that could be parsed as an option or a
+# different transport (ext::, file://, a local path, ...).
+_SSH_CLONE_URL = re.compile(r"git@([A-Za-z0-9.-]+):[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_BRANCH_NAME = re.compile(r"[A-Za-z0-9_.][A-Za-z0-9_./-]*")
+
+
+def is_allowed_clone_url(cfg: dict, url: str) -> bool:
+    match = _SSH_CLONE_URL.fullmatch(url)
+    return bool(match) and match.group(1) in cfg.get("sync_git_clone_hosts", [])
+
+
+async def _run_subprocess(args: list[str], timeout: int, env: dict | None = None) -> SyncResult:
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **({"env": env} if env is not None else {}),
         )
     except OSError as exc:
         logger.warning("could not start %s: %s", args[0], exc)
@@ -219,8 +241,17 @@ async def list_remote_only_projects(cfg: dict, local_names: set[str]) -> list[st
     excluding remote git repos. Returns [] on any failure/timeout -- a
     failed listing just means "nothing new to show this time", not an
     error worth surfacing."""
+    return (await list_remote_only(cfg, local_names))[0]
+
+
+async def list_remote_only(cfg: dict, local_names: set[str]) -> tuple[list[str], list[str]]:
+    """(non-git names, git names) present under the remote projects_dir
+    but not in local_names. A git repo is only included if its origin is
+    something materialize_remote_git_project would agree to clone -- one
+    with no remote, or a remote on a host that isn't allowlisted, has no
+    way to get here and would just be a button that always fails."""
     if not sync_enabled(cfg):
-        return []
+        return [], []
 
     shell_cmd = build_remote_listing_command(cfg["sync_remote_projects_dir"])
     connect_timeout = cfg["sync_connect_timeout_seconds"]
@@ -228,14 +259,19 @@ async def list_remote_only_projects(cfg: dict, local_names: set[str]) -> list[st
 
     result = await _run_subprocess(args, connect_timeout + 5)
     if not result.ok:
-        return []
+        return [], []
 
-    remote_names = []
+    plain_names, git_names = [], []
     for line in result.stdout.splitlines():
-        name, _, kind = line.partition("\t")
-        if name and kind == "nogit" and name not in local_names:
-            remote_names.append(name)
-    return sorted(remote_names)
+        name, _, rest = line.partition("\t")
+        kind, _, url = rest.partition("\t")
+        if not name or name in local_names:
+            continue
+        if kind == "nogit":
+            plain_names.append(name)
+        elif kind == "git" and is_allowed_clone_url(cfg, url.strip()):
+            git_names.append(name)
+    return sorted(plain_names), sorted(git_names)
 
 
 async def materialize_remote_project(cfg: dict, project_name: str, project_dir: str) -> SyncResult:
@@ -252,3 +288,100 @@ async def materialize_remote_project(cfg: dict, project_name: str, project_dir: 
 
     await sync_history_with_remote(cfg, project_dir, "pull")
     return result
+
+
+def build_remote_git_state_command(remote_project_dir: str) -> str:
+    """Shell one-liner run on the remote host: key=value lines describing
+    a git project there -- where to clone it from, and how much of what is
+    on that host a clone would *not* bring along."""
+    return (
+        f"cd -- {shlex.quote(remote_project_dir)} && "
+        "printf 'url=%s\\n' \"$(git remote get-url origin 2>/dev/null)\" && "
+        "printf 'branch=%s\\n' \"$(git branch --show-current)\" && "
+        # Commits on any local branch that no remote-tracking ref has --
+        # unlike @{u}..HEAD this also works for a branch with no upstream.
+        "printf 'unpushed=%s\\n' \"$(git rev-list --count --branches --not --remotes)\" && "
+        "printf 'dirty=%s\\n' \"$(git status --porcelain | wc -l)\" && "
+        "printf 'ignored=%s\\n' \"$(git status --porcelain --ignored | grep -c '^!!')\""
+    )
+
+
+def _clone_caveats(state: dict) -> list[str]:
+    def count(key: str) -> int:
+        value = state.get(key, "").strip()
+        return int(value) if value.isdigit() else 0
+
+    caveats = []
+    if count("unpushed"):
+        caveats.append(f"{count('unpushed')} commit(s) there were never pushed")
+    if count("dirty"):
+        caveats.append(f"{count('dirty')} uncommitted change(s) there")
+    if count("ignored"):
+        caveats.append(
+            f"{count('ignored')} git-ignored path(s) there (virtualenvs, data, local config...)"
+        )
+    return caveats
+
+
+async def materialize_remote_git_project(
+    cfg: dict, project_name: str, project_dir: str
+) -> tuple[SyncResult, list[str]]:
+    """One-time `git clone` of a git project that only exists on the other
+    host, from that project's own origin (not from the other host: this
+    mechanism never copies a git working tree between hosts).
+
+    Returns (result, notes). On success, notes are things the user should
+    know because a clone only carries what was pushed: unpushed commits,
+    uncommitted changes and git-ignored files all stay behind on the
+    other host, and nothing here can tell whether they matter."""
+    if project_name != os.path.basename(project_name) or project_name.startswith((".", "-")):
+        return SyncResult(False, "not a valid project name"), []
+    if os.path.exists(project_dir):
+        return SyncResult(False, "already exists locally"), []
+
+    connect_timeout = cfg["sync_connect_timeout_seconds"]
+    remote_dir = os.path.join(cfg["sync_remote_projects_dir"], project_name)
+    state_result = await _run_subprocess(
+        ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={connect_timeout}",
+         cfg["sync_host"], build_remote_git_state_command(remote_dir)],
+        connect_timeout + 15,
+    )
+    if not state_result.ok:
+        return SyncResult(False, f"could not inspect it on the other host: {state_result.detail}"), []
+    state = dict(line.split("=", 1) for line in state_result.stdout.splitlines() if "=" in line)
+
+    url = state.get("url", "").strip()
+    if not is_allowed_clone_url(cfg, url):
+        return SyncResult(False, "its origin is not an SSH URL on an allowed host"), []
+
+    notes = []
+    env = {
+        **os.environ,
+        # Never wait on a prompt nobody can answer.
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_SSH_COMMAND": f"ssh -o BatchMode=yes -o ConnectTimeout={connect_timeout}",
+    }
+    branch = state.get("branch", "").strip()
+    result = None
+    if _BRANCH_NAME.fullmatch(branch):
+        result = await _run_subprocess(
+            ["git", "clone", "--branch", branch, "--", url, project_dir],
+            FIRST_SYNC_TIMEOUT_SECONDS, env,
+        )
+        if not result.ok:
+            # Most likely a branch that was never pushed. An interrupted
+            # clone can leave a partial directory behind; project_dir did
+            # not exist before this call, so it is ours to remove.
+            shutil.rmtree(project_dir, ignore_errors=True)
+            notes.append(f"branch '{branch}' could not be cloned, got the default branch instead")
+            result = None
+    if result is None:
+        result = await _run_subprocess(
+            ["git", "clone", "--", url, project_dir], FIRST_SYNC_TIMEOUT_SECONDS, env
+        )
+    if not result.ok:
+        shutil.rmtree(project_dir, ignore_errors=True)
+        return result, []
+
+    await sync_history_with_remote(cfg, project_dir, "pull")
+    return result, notes + _clone_caveats(state)

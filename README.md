@@ -82,7 +82,14 @@ as a fallback for the narrow case where you don't.
    other is never wiped out) pulling from the second host before the message
    and pushing back after, and `/projects` also lists non-git projects that
    only exist on the second host (labeled "(remoto)"), copying one down on
-   first selection. Separately (and regardless of whether the project itself
+   first selection. Git repos that only exist there are listed too (labeled
+   "(remoto, git)") and are `git clone`d from their own `origin` on first
+   selection — never copied from the other host — on the branch that host
+   has checked out. The reply then lists what a clone leaves behind there
+   (unpushed commits, uncommitted changes, git-ignored files). Only SSH
+   origins (`git@host:owner/repo`) on a host listed in
+   `sync_git_clone_hosts` (default `["github.com"]`) are offered, and the
+   bridge's machine needs its own SSH access to that host. Separately (and regardless of whether the project itself
    is git-managed), each project's Claude Code session history under
    `~/.claude/projects/` is synced the same way, so `--continue` sees the
    same conversation whichever host you last used. If that project has a
@@ -243,10 +250,11 @@ concluding the test passed or failed:
 - Attachment support covers photos and documents only.
 - The "detect a permission block and suggest flight mode" behavior is
   best-effort text matching on Claude's output, not a structured signal.
-- The second-host sync's "(remoto)" listing in `/projects` only covers
-  non-git project directories. A project that only exists on the second
-  host and is itself a git repo won't show up there — `git clone` it
-  ahead of time as usual.
+- A git repo that only exists on the second host is cloned from its
+  origin, so it arrives without anything git ignores there: virtualenvs,
+  local config, data files. Whatever it needs to actually run has to be
+  recreated on the bridge's machine. Repos with no origin, or one that
+  isn't an SSH URL on an allowed host, are not listed at all.
 - The check that refuses to sync a project while it has a live Claude Code
   session on the other host fails open if that host can't be reached right
   now (consistent with the rest of the sync feature never blocking on an

@@ -8,5 +8,7 @@
   "sync_host": "",
   "sync_remote_projects_dir": "~/claude",
   "sync_connect_timeout_seconds": 5,
-  "sync_rsync_timeout_seconds": 120
+  "sync_rsync_timeout_seconds": 120,
+  "_sync_git_clone_hosts_comment": "Hosts a git project that only exists on sync_host may be cloned from (SSH origins only, git@host:owner/repo).",
+  "sync_git_clone_hosts": ["github.com"]
 }
