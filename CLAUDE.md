@@ -67,6 +67,25 @@
   path since git already refuses instead of guessing when it can't cleanly
   fast-forward, so there's no live-session hijack risk to guard against
   here the way there is for history sync.
+- A git project that only exists on the other host used to be invisible
+  to `/projects` (its listing skipped remote git repos, and rsync must
+  never touch one), which only works if you remember to clone it ahead of
+  time -- exactly what you can't fix from a messaging-only connection.
+  `sync.materialize_remote_git_project` ("projgit:" callback, "(remoto,
+  git)" buttons) clones it from the project's own `origin`, on the branch
+  the other host has checked out, and pulls its session history. It
+  clones from the origin rather than from the other host on purpose: that
+  keeps git as the only thing that ever moves a repo between hosts. The
+  cost is that unpushed commits, uncommitted changes and git-ignored
+  files stay behind, so the reply counts them instead of pretending the
+  copy is complete (ignored files are usually virtualenvs built for
+  another CPU architecture and bulky data, not worth copying blindly).
+- The origin URL is read from the other host and passed to `git clone`
+  running with this host's credentials, so `sync.is_allowed_clone_url`
+  treats it as untrusted: scp-style SSH form only, host must be in
+  `sync_git_clone_hosts`, `fullmatch` so nothing can ride along, and the
+  clone uses `--` before it. Don't loosen that regex to accept `https://`,
+  `ssh://` or paths without thinking through `ext::`/option injection.
 - Claude Code's own session history (what makes `--continue` work) lives
   under `~/.claude/projects/<encoded-path>/`, entirely outside the project
   directory — so it's invisible to both git and the rsync above, for every

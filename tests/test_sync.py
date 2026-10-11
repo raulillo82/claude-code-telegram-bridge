@@ -274,3 +274,156 @@ def test_sync_history_with_remote_pull_creates_dir_and_runs(tmp_path, monkeypatc
     result = asyncio.run(sync.sync_history_with_remote(cfg, project_dir, "pull"))
     assert result.ok
     assert len(calls) == 1
+
+
+def test_list_remote_only_offers_git_repos_only_with_an_allowed_origin(monkeypatch):
+    async def fake_exec(*args, **kwargs):
+        stdout = (
+            b"scratch\tnogit\n"
+            b"cloneable\tgit\tgit@github.com:someone/cloneable.git\n"
+            b"no_remote\tgit\t\n"
+            b"other_host\tgit\tgit@example.org:someone/repo.git\n"
+            b"https_remote\tgit\thttps://github.com/someone/repo.git\n"
+            b"already_local\tgit\tgit@github.com:someone/already.git\n"
+        )
+        return FakeProc(returncode=0, stdout=stdout)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    cfg = make_cfg(sync_git_clone_hosts=["github.com"])
+    plain, git = asyncio.run(sync.list_remote_only(cfg, {"already_local"}))
+    assert plain == ["scratch"]
+    assert git == ["cloneable"]
+
+
+def test_is_allowed_clone_url_rejects_anything_but_plain_ssh_on_an_allowed_host():
+    """The URL comes from the other host and is handed to `git clone` with
+    this host's credentials, so it must not be able to pick another
+    transport, another host, or smuggle in an option."""
+    cfg = make_cfg(sync_git_clone_hosts=["github.com"])
+    assert sync.is_allowed_clone_url(cfg, "git@github.com:someone/repo.git")
+    assert sync.is_allowed_clone_url(cfg, "git@github.com:someone/repo")
+    for bad in [
+        "",
+        "git@example.org:someone/repo.git",
+        "https://github.com/someone/repo.git",
+        "ext::sh -c 'touch /tmp/pwned'",
+        "--upload-pack=touch /tmp/pwned",
+        "-oProxyCommand=evil git@github.com:someone/repo.git",
+        "git@github.com:someone/repo.git --upload-pack=evil",
+        "git@github.com:-oProxyCommand=evil/repo",
+        "/some/local/path",
+        "file:///some/local/path",
+        "git@github.com:someone/repo.git\nurl=evil",
+    ]:
+        assert not sync.is_allowed_clone_url(cfg, bad), bad
+    assert not sync.is_allowed_clone_url(make_cfg(), "git@github.com:someone/repo.git")
+
+
+def _git_materialize_exec(calls, state_stdout, clone_results):
+    """ssh -> state_stdout; successive `git clone` calls -> clone_results;
+    anything else (the history rsync) succeeds."""
+    clone_results = list(clone_results)
+
+    async def fake_exec(*args, **kwargs):
+        calls.append(args)
+        if args[0] == "ssh":
+            return FakeProc(returncode=0, stdout=state_stdout)
+        if args[0] == "git":
+            return clone_results.pop(0)
+        return FakeProc(returncode=0)
+
+    return fake_exec
+
+
+def test_materialize_remote_git_project_clones_from_origin_and_reports_what_stays_behind(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    project_dir = str(tmp_path / "claude" / "repo")
+    calls = []
+    state = b"url=git@github.com:someone/repo.git\nbranch=feature/x\nunpushed=2\ndirty=0\nignored=15\n"
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", _git_materialize_exec(calls, state, [FakeProc(returncode=0)])
+    )
+    cfg = make_cfg(sync_git_clone_hosts=["github.com"])
+
+    result, notes = asyncio.run(sync.materialize_remote_git_project(cfg, "repo", project_dir))
+
+    assert result.ok
+    clone = next(call for call in calls if call[0] == "git")
+    assert clone == ("git", "clone", "--branch", "feature/x", "--", "git@github.com:someone/repo.git", project_dir)
+    assert any("2 commit(s)" in note for note in notes)
+    assert any("15 git-ignored" in note for note in notes)
+    assert not any("uncommitted" in note for note in notes)
+    # Session history comes along too, like for non-git projects.
+    assert calls[-1][0] == "rsync"
+
+
+def test_materialize_remote_git_project_falls_back_to_default_branch(tmp_path, monkeypatch):
+    # The other host is on a branch that was never pushed.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    project_dir = str(tmp_path / "claude" / "repo")
+    calls = []
+    state = b"url=git@github.com:someone/repo.git\nbranch=local-only\nunpushed=1\ndirty=0\nignored=0\n"
+    clones = [FakeProc(returncode=128, stderr=b"Remote branch local-only not found"), FakeProc(returncode=0)]
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _git_materialize_exec(calls, state, clones))
+    cfg = make_cfg(sync_git_clone_hosts=["github.com"])
+
+    result, notes = asyncio.run(sync.materialize_remote_git_project(cfg, "repo", project_dir))
+
+    assert result.ok
+    git_calls = [call for call in calls if call[0] == "git"]
+    assert git_calls[1] == ("git", "clone", "--", "git@github.com:someone/repo.git", project_dir)
+    assert any("local-only" in note for note in notes)
+
+
+def test_materialize_remote_git_project_refuses_a_disallowed_origin(tmp_path, monkeypatch):
+    project_dir = str(tmp_path / "claude" / "repo")
+    calls = []
+    state = b"url=ext::sh -c evil\nbranch=main\nunpushed=0\ndirty=0\nignored=0\n"
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _git_materialize_exec(calls, state, []))
+    cfg = make_cfg(sync_git_clone_hosts=["github.com"])
+
+    result, notes = asyncio.run(sync.materialize_remote_git_project(cfg, "repo", project_dir))
+
+    assert not result.ok
+    assert not any(call[0] == "git" for call in calls)
+    assert not os.path.exists(project_dir)
+
+
+def test_materialize_remote_git_project_never_overwrites_or_escapes(tmp_path, monkeypatch):
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("nothing should run")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_if_called)
+    cfg = make_cfg(sync_git_clone_hosts=["github.com"])
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    (existing / "keep.txt").write_text("precious")
+
+    result, _ = asyncio.run(sync.materialize_remote_git_project(cfg, "existing", str(existing)))
+    assert not result.ok
+    assert (existing / "keep.txt").read_text() == "precious"
+
+    for name in ["../escape", "-oProxyCommand=evil", ".hidden"]:
+        result, _ = asyncio.run(sync.materialize_remote_git_project(cfg, name, str(tmp_path / "x")))
+        assert not result.ok, name
+
+
+def test_materialize_remote_git_project_removes_partial_clone_on_failure(tmp_path, monkeypatch):
+    project_dir = tmp_path / "claude" / "repo"
+    state = b"url=git@github.com:someone/repo.git\nbranch=\nunpushed=0\ndirty=0\nignored=0\n"
+
+    async def fake_exec(*args, **kwargs):
+        if args[0] == "ssh":
+            return FakeProc(returncode=0, stdout=state)
+        project_dir.mkdir(parents=True)
+        (project_dir / "half").write_text("partial")
+        return FakeProc(returncode=128, stderr=b"fatal: early EOF")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    cfg = make_cfg(sync_git_clone_hosts=["github.com"])
+
+    result, _ = asyncio.run(sync.materialize_remote_git_project(cfg, "repo", str(project_dir)))
+
+    assert not result.ok
+    assert "early EOF" in result.detail
+    assert not project_dir.exists()
