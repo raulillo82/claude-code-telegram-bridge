@@ -136,3 +136,52 @@ def test_push_if_ahead_reports_push_failure(tmp_path, monkeypatch):
     assert not result.ok
     assert not result.skipped
     assert "rejected" in result.detail
+
+
+def _fake_git(calls, gpgsign, statuses):
+    async def fake_exec(*args, **kwargs):
+        calls.append(args)
+        if "rev-list" in args:
+            return FakeProc(returncode=0, stdout=b"2\n")
+        if "config" in args:
+            return FakeProc(returncode=0, stdout=gpgsign)
+        if "log" in args:
+            return FakeProc(returncode=0, stdout=statuses)
+        return FakeProc(returncode=0)
+
+    return fake_exec
+
+
+def test_push_if_ahead_refuses_unsigned_commits_when_signing_is_on(tmp_path, monkeypatch):
+    """A commit made with --no-gpg-sign while the key was locked must stay
+    local until it is re-signed -- pushing it automatically would force a
+    history rewrite on the remote later."""
+    (tmp_path / ".git").mkdir()
+    calls = []
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_git(calls, b"true\n", b"G\nN\n"))
+    result = asyncio.run(git_sync.push_if_ahead(str(tmp_path)))
+    assert not result.ok
+    assert not result.skipped
+    assert "1 unsigned" in result.detail
+    assert all(call[-1] != "push" for call in calls)
+
+
+def test_push_if_ahead_pushes_signed_commits_when_signing_is_on(tmp_path, monkeypatch):
+    # E = signed with a key missing from the local keyring (e.g. a commit
+    # merged through the hosting provider's web UI): not ours to block.
+    (tmp_path / ".git").mkdir()
+    calls = []
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_git(calls, b"true\n", b"G\nE\nU\n"))
+    result = asyncio.run(git_sync.push_if_ahead(str(tmp_path)))
+    assert result.ok
+    assert calls[-1][-1] == "push"
+
+
+def test_push_if_ahead_ignores_signatures_when_signing_is_off(tmp_path, monkeypatch):
+    (tmp_path / ".git").mkdir()
+    calls = []
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_git(calls, b"false\n", b"N\nN\n"))
+    result = asyncio.run(git_sync.push_if_ahead(str(tmp_path)))
+    assert result.ok
+    assert calls[-1][-1] == "push"
+    assert not any("log" in call for call in calls)
