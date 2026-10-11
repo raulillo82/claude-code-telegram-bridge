@@ -68,10 +68,36 @@ async def pull(project_dir: str) -> SyncResult:
     return await _run_git(project_dir, ["pull", "--ff-only"])
 
 
+async def _unsigned_commits_to_push(project_dir: str) -> int:
+    """How many commits in @{u}..HEAD must not be pushed for lack of a
+    valid signature -- always 0 unless the project (or the user's global
+    git config) sets commit.gpgsign, i.e. only for someone who has already
+    said they want their commits signed.
+
+    Counts %G? = N (no signature) and B (bad one). Deliberately not E
+    ("can't check": signed with a key that isn't in the local keyring),
+    which is what any commit merged through a hosting provider's web UI
+    looks like from here.
+    """
+    wants_signing = await _run_git(
+        project_dir, ["config", "--type=bool", "--default=false", "--get", "commit.gpgsign"]
+    )
+    if not wants_signing.ok or wants_signing.stdout.strip() != "true":
+        return 0
+    statuses = await _run_git(project_dir, ["log", "--format=%G?", "@{u}..HEAD"])
+    if not statuses.ok:
+        return 0
+    return sum(1 for status in statuses.stdout.split() if status in ("N", "B"))
+
+
 async def push_if_ahead(project_dir: str) -> SyncResult:
     """Pushes only if HEAD is ahead of its upstream tracking branch --
     a no-op (skipped) when there's nothing new, no upstream configured,
-    or this isn't a git project at all."""
+    or this isn't a git project at all. Refuses (a failure, so the user
+    gets told) when commit.gpgsign is on and some of those commits are
+    unsigned: that happens when the signing key was locked and the commit
+    was made with --no-gpg-sign to be re-signed later, and re-signing
+    something already pushed means a force-push."""
     if not is_git_project(project_dir):
         return SyncResult(True, "not a git project", skipped=True)
 
@@ -81,5 +107,10 @@ async def push_if_ahead(project_dir: str) -> SyncResult:
         return SyncResult(True, "no upstream to compare against", skipped=True)
     if count.stdout.strip() == "0":
         return SyncResult(True, "nothing to push", skipped=True)
+
+    unsigned = await _unsigned_commits_to_push(project_dir)
+    if unsigned:
+        logger.warning("not pushing %s: %d unsigned commit(s) pending", project_dir, unsigned)
+        return SyncResult(False, f"{unsigned} unsigned commit(s) pending, re-sign them first")
 
     return await _run_git(project_dir, ["push"])

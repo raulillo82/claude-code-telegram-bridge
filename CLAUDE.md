@@ -56,6 +56,12 @@
   before, `push_if_ahead()` runs `git push` after (only if HEAD is ahead of
   its upstream — checked via `git rev-list --count @{u}..HEAD`, itself
   skipped/treated as a no-op if there's no upstream configured at all).
+  `push_if_ahead()` also refuses, and says so in the reply, when
+  `commit.gpgsign` is on and any commit in that range is unsigned or badly
+  signed: a commit made with `--no-gpg-sign` because the key was locked is
+  meant to be re-signed before it leaves the host, and an automatic push
+  would turn that into a force-push. Keyed off git's own config rather
+  than a bridge setting so it stays off for anyone who doesn't sign.
   Independent of the `sync_host` feature entirely (no config flag, always
   on for any project with a `.git`) — safer by construction than the rsync
   path since git already refuses instead of guessing when it can't cleanly
