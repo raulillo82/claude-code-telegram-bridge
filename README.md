@@ -56,11 +56,11 @@ as a fallback for the narrow case where you don't.
    ```
    The bridge decrypts it on startup (falling back to `config.json`'s
    `bot_token` if set, so this is opt-in). This needs your GPG key
-   unlocked/cached in `gpg-agent` at the time the bridge starts — if it
-   isn't, startup fails asking for one or the other. Since the systemd
-   service below uses `Restart=always`, a crash after the key's cache
-   expires means it will keep failing to restart until the key is
-   unlocked again.
+   unlocked/cached in `gpg-agent` — if it isn't when the bridge
+   starts, it waits and retries (every 5 s at first, backing off to every
+   5 min) until you unlock the key, then comes up by itself. Meanwhile
+   `systemctl --user status` shows the service as `activating` with a
+   `Status:` line saying so.
 4. Optional: two-way sync of non-git project directories with a second
    host, useful if the bridge runs on a dedicated always-on machine while
    your projects mostly live on a laptop that isn't always reachable. Only
@@ -111,7 +111,11 @@ loginctl enable-linger "$USER"   # keep it running with no active login session
 The unit assumes the repo lives at `~/claude/claude-code-telegram-bridge`;
 edit `deploy/claude-code-telegram-bridge.service` first if yours doesn't.
 Check on it with `systemctl --user status claude-code-telegram-bridge` or
-`journalctl --user -u claude-code-telegram-bridge -f`.
+`journalctl --user -u claude-code-telegram-bridge -f`. `active` means
+Telegram has accepted the token and the bridge is polling; `activating`
+means it is still waiting for the GPG key; `failed` with exit status 78
+means Telegram rejected the token (revoked or rotated) — store the current
+one and `systemctl --user start` it again.
 
 ## Usage
 

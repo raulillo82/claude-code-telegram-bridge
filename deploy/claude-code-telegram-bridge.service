@@ -4,7 +4,13 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# The bridge reports READY only once Telegram has accepted the token, so
+# "activating" (with a Status= line in `systemctl status`) honestly covers
+# the wait for the GPG key to be unlocked -- which can take as long as it
+# takes a human to do it, hence no start timeout.
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=infinity
 # `claude` typically lives in ~/.local/bin, which a systemd --user unit's
 # default PATH does not include -- without this, run_claude's subprocess
 # call fails with FileNotFoundError: 'claude'.
@@ -12,7 +18,10 @@ Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 WorkingDirectory=%h/claude/claude-code-telegram-bridge
 ExecStart=%h/claude/claude-code-telegram-bridge/.venv/bin/python %h/claude/claude-code-telegram-bridge/run.py
 Restart=always
-RestartSec=5
+RestartSec=30
+# Exit status 78 = Telegram rejected the token. Restarting can't fix that,
+# so leave the unit "failed" instead of looping.
+RestartPreventExitStatus=78
 
 [Install]
 WantedBy=default.target

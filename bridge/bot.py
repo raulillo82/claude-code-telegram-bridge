@@ -12,10 +12,12 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import InvalidToken
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -25,7 +27,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import git_sync, permissions, projects, sync
+from . import git_sync, permissions, projects, sdnotify, sync
 from .claude_runner import run_claude
 from .history_preview import get_last_assistant_message
 from .state import BotState
@@ -43,6 +45,21 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 BOT_TOKEN_GPG_PATH = Path.home() / ".credentials" / "telegram-bot-token.gpg"
 TELEGRAM_MAX_CHARS = 4000
 
+# Decrypting the token needs the GPG key unlocked in gpg-agent, which is a
+# manual step (`gpg-unlock`) that can lag any (re)start by hours. Wait for
+# it in-process instead of exiting: the bridge then comes up by itself the
+# moment the key is unlocked, rather than hammering systemd's restart loop.
+TOKEN_RETRY_INITIAL_SECONDS = 5
+TOKEN_RETRY_MAX_SECONDS = 300
+
+# Telegram rejecting the token is not something a restart can fix (it was
+# revoked or rotated) -- exit with a status the systemd unit lists in
+# RestartPreventExitStatus, so the service ends up visibly "failed" instead
+# of looping. 78 is EX_CONFIG from sysexits.h.
+EXIT_INVALID_TOKEN = 78
+
+POLLER_CHECK_SECONDS = 30
+
 BOT_COMMANDS = [
     BotCommand("start", "Show bridge status and quick help"),
     BotCommand("projects", "Pick the active project"),
@@ -59,6 +76,8 @@ def _load_bot_token(cfg: dict) -> str:
     hasn't adopted the ~/.credentials/*.gpg convention. Otherwise decrypt
     it from there, which requires the user's GPG key to be unlocked
     (see the "Firma de commits" section of the global CLAUDE.md / `gpg-unlock`).
+    While gpg can't decrypt it, keep retrying with backoff rather than
+    failing: a locked key is the expected state after any reboot.
     """
     token = cfg.get("bot_token")
     if token:
@@ -68,13 +87,35 @@ def _load_bot_token(cfg: dict) -> str:
             "No bot_token in config.json and no encrypted token at "
             f"{BOT_TOKEN_GPG_PATH}. Set one or the other."
         )
-    result = subprocess.run(
-        ["gpg", "--decrypt", str(BOT_TOKEN_GPG_PATH)],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return result.stdout.strip()
+    delay = TOKEN_RETRY_INITIAL_SECONDS
+    attempt = 0
+    while True:
+        attempt += 1
+        result = subprocess.run(
+            ["gpg", "--decrypt", str(BOT_TOKEN_GPG_PATH)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            token = result.stdout.strip()
+            if not token:
+                raise RuntimeError(f"{BOT_TOKEN_GPG_PATH} decrypted to an empty token.")
+            return token
+        # gpg's own wording for a locked key is localized and varies
+        # ("No secret key", "Operation cancelled", ...), so any failure is
+        # treated as "not unlocked yet" -- its last line goes to the log
+        # for the cases where it's something else.
+        reason = (result.stderr or "").strip().splitlines()[-1:] or ["no output"]
+        logger.warning(
+            "Could not decrypt the bot token (attempt %d, gpg exit %d: %s). "
+            "Is the GPG key unlocked? Retrying in %ds.",
+            attempt, result.returncode, reason[0], delay,
+        )
+        sdnotify.notify(
+            f"STATUS=Waiting for the GPG key to be unlocked (attempt {attempt}, next in {delay}s)"
+        )
+        time.sleep(delay)
+        delay = min(delay * 2, TOKEN_RETRY_MAX_SECONDS)
 
 
 def load_config() -> dict:
@@ -645,15 +686,60 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await send_long_message(update, reply)
 
 
-async def _register_commands(application: Application) -> None:
+def _polling_task(application: Application):
+    # python-telegram-bot exposes no public handle on (or callback for) the
+    # death of its polling task, hence the name-mangled private attribute.
+    # Returns None if a future version renames it, which just disables the
+    # watchdog below.
+    return getattr(application.updater, "_Updater__polling_task", None)
+
+
+async def _watch_poller(application: Application, interval: float = POLLER_CHECK_SECONDS) -> None:
+    """Stop the application if its polling task has died.
+
+    On an invalid token (and on any unexpected exception) the library ends
+    the polling task but leaves the process running: it never receives
+    another update, yet systemd keeps reporting it as active. That went
+    unnoticed for weeks once, after the token was rotated under a running
+    instance. Stopping makes run_polling re-raise whatever killed the task,
+    so main() can exit with the right status.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        task = _polling_task(application)
+        if task is not None and task.done() and application.running:
+            logger.critical("The Telegram polling task has died; shutting down.")
+            application.stop_running()
+            return
+
+
+async def _post_init(application: Application) -> None:
     await application.bot.set_my_commands(BOT_COMMANDS)
+    application.bot_data["poller_watchdog"] = asyncio.create_task(_watch_poller(application))
+    # Getting here means Telegram accepted the token (initialize() calls
+    # getMe), so "active" in systemd now implies a working token.
+    sdnotify.notify("READY=1\nSTATUS=Polling Telegram")
+
+
+async def _post_stop(application: Application) -> None:
+    watchdog = application.bot_data.pop("poller_watchdog", None)
+    if watchdog is not None:
+        watchdog.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watchdog
 
 
 def main() -> None:
     cfg = load_config()
     state = BotState()
 
-    app = Application.builder().token(cfg["bot_token"]).post_init(_register_commands).build()
+    app = (
+        Application.builder()
+        .token(cfg["bot_token"])
+        .post_init(_post_init)
+        .post_stop(_post_stop)
+        .build()
+    )
     app.bot_data["config"] = cfg
     app.bot_data["state"] = state
 
@@ -666,7 +752,17 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
     logger.info("Starting Claude Code Telegram bridge (long polling)")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        # bootstrap_retries=-1: keep retrying while the network isn't up yet
+        # at boot (an invalid token still aborts immediately).
+        app.run_polling(allowed_updates=Update.ALL_TYPES, bootstrap_retries=-1)
+    except InvalidToken:
+        logger.critical(
+            "Telegram rejected the bot token (revoked or rotated?). Not restarting: "
+            "store the current token and start the service again."
+        )
+        sdnotify.notify("STATUS=Telegram rejected the bot token; update it and start again")
+        sys.exit(EXIT_INVALID_TOKEN)
 
 
 if __name__ == "__main__":

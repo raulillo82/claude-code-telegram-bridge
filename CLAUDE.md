@@ -112,10 +112,42 @@
   to be reapplied by hand.
 - Decrypting it on startup requires the user's GPG key to be unlocked in
   `gpg-agent` at that moment (see the "Firma de commits"/`gpg-unlock`
-  section of the global `CLAUDE.md`). The systemd service uses
-  `Restart=always`: if the process dies after the key's cache expires (8h
-  after `gpg-unlock`), it will keep failing to start until someone unlocks
-  it again.
+  section of the global `CLAUDE.md`). If it isn't (the normal state after
+  any reboot, or 8h after `gpg-unlock`), `_load_bot_token` waits in-process
+  and retries with backoff (5s up to 5min) instead of exiting, so the
+  bridge comes up by itself once someone unlocks the key. It used to exit
+  and lean on `Restart=always`, which once produced ~120,000 restarts over
+  nine days with nobody noticing.
+- The unit is `Type=notify` and the bridge only sends `READY=1` from
+  `_post_init`, i.e. after Telegram has accepted the token. So the systemd
+  state is meant to be trusted: `activating` = still waiting for the GPG
+  key (the `Status:` line says so), `active` = polling with a valid token,
+  `failed` with exit status 78 = Telegram rejected the token
+  (`RestartPreventExitStatus=78`: a restart can't fix a revoked token).
+- **Rotating the token under a running instance kills it silently unless
+  it is restarted.** python-telegram-bot ends its polling task on
+  `InvalidToken` but leaves the process alive, and systemd kept showing it
+  `active`: this happened for real (token rotated in BotFather, new `.gpg`
+  written, service never restarted) and went unnoticed for three weeks,
+  until a reboot surfaced the stored exception -- which then looked like
+  the token had "just" been rejected that day. `_watch_poller` now stops
+  the application when the polling task dies, which makes `run_polling`
+  re-raise the cause and `main()` exit 78. It reads a name-mangled private
+  attribute (`_Updater__polling_task`) because the library has no public
+  hook for this; if a library upgrade renames it the watchdog silently
+  turns into a no-op, so re-check it when bumping the `<22.0` pin.
+- After rotating the token, always restart the service on the host that
+  runs the bridge and confirm it reaches `active` there -- and make sure no
+  other host still has the unit enabled: a forgotten second copy answering
+  with the new token is exactly what masked the dead one.
+- A host without a hardware clock can boot weeks in the past until NTP
+  steps it, so journal entries from the first seconds after boot carry a
+  bogus date and uptime derived from wall-clock boot time is wrong. Use
+  `/proc/uptime` and `journalctl --list-boots` before trusting dates when
+  diagnosing "when did it die".
+- `After=network-online.target` in the unit is a no-op: that target does
+  not exist for `systemctl --user`. What actually covers "network not up
+  yet at boot" is `bootstrap_retries=-1` in `run_polling`.
 - **`gpg-unlock` must preset both the signing key and the encryption
   subkey.** Decrypting this token uses the `ssb [E]` encryption subkey,
   which has its own keygrip and its own cache entry in `gpg-agent` —
